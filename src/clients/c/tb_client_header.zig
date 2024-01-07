@@ -14,6 +14,8 @@ const type_mappings = .{
     .{ tb_client.tb_operation_t, "TB_OPERATION" },
     .{ tb_client.tb_packet_status_t, "TB_PACKET_STATUS" },
     .{ tb_client.tb_packet_acquire_status_t, "TB_PACKET_ACQUIRE_STATUS" },
+    .{ tb.GetAccountTransfers, "tb_get_account_transfers_t" },
+    .{ tb.GetAccountTransfersFlags, "TB_GET_ACCOUNT_TRANSFERS_FLAGS" },
     .{ tb_client.tb_packet_t, "tb_packet_t" },
     .{ tb_client.tb_client_t, "tb_client_t" },
     .{ tb_client.tb_status_t, "TB_STATUS" },
@@ -53,7 +55,7 @@ fn resolve_c_type(comptime Type: type) []const u8 {
                 }
             }
 
-            return resolve_c_type(info.child) ++ "*";
+            return comptime resolve_c_type(info.child) ++ "*";
         },
         .Void, .Opaque => return "void",
         else => @compileError("Unhandled type: " ++ @typeName(Type)),
@@ -62,9 +64,9 @@ fn resolve_c_type(comptime Type: type) []const u8 {
 
 fn to_uppercase(comptime input: []const u8) []const u8 {
     comptime var output: [input.len]u8 = undefined;
-    inline for (output) |*char, i| {
+    inline for (&output, 0..) |*char, i| {
         char.* = input[i];
-        char.* -= 32 * @as(u8, @boolToInt(char.* >= 'a' and char.* <= 'z'));
+        char.* -= 32 * @as(u8, @intFromBool(char.* >= 'a' and char.* <= 'z'));
     }
     return &output;
 }
@@ -74,7 +76,6 @@ fn emit_enum(
     comptime Type: type,
     comptime type_info: anytype,
     comptime c_name: []const u8,
-    comptime value_fmt: []const u8,
     comptime skip_fields: []const []const u8,
 ) !void {
     var suffix_pos = std.mem.lastIndexOf(u8, c_name, "_").?;
@@ -82,21 +83,27 @@ fn emit_enum(
 
     try buffer.writer().print("typedef enum {s} {{\n", .{c_name});
 
-    inline for (type_info.fields) |field, i| {
+    inline for (type_info.fields, 0..) |field, i| {
         comptime var skip = false;
         inline for (skip_fields) |sf| {
             skip = skip or comptime std.mem.eql(u8, sf, field.name);
         }
 
         if (!skip) {
-            try buffer.writer().print("    {s}_{s} = " ++ value_fmt ++ ",\n", .{
-                c_name[0..suffix_pos],
-                to_uppercase(field.name),
-                if (@typeInfo(Type) == .Enum)
-                    @enumToInt(@field(Type, field.name))
-                else
-                    i, // packed struct field.
-            });
+            if (@typeInfo(Type) == .Enum) {
+                try buffer.writer().print("    {s}_{s} = {},\n", .{
+                    c_name[0..suffix_pos],
+                    to_uppercase(field.name),
+                    @intFromEnum(@field(Type, field.name)),
+                });
+            } else {
+                // Packed structs.
+                try buffer.writer().print("    {s}_{s} = 1 << {},\n", .{
+                    c_name[0..suffix_pos],
+                    to_uppercase(field.name),
+                    i,
+                });
+            }
         }
     }
 
@@ -112,11 +119,11 @@ fn emit_struct(
 
     inline for (type_info.fields) |field| {
         try buffer.writer().print("    {s} {s}", .{
-            resolve_c_type(field.field_type),
+            resolve_c_type(field.type),
             field.name,
         });
 
-        switch (@typeInfo(field.field_type)) {
+        switch (@typeInfo(field.type)) {
             .Array => |array| try buffer.writer().print("[{d}]", .{array.len}),
             else => {},
         }
@@ -165,7 +172,7 @@ pub fn main() !void {
         switch (@typeInfo(ZigType)) {
             .Struct => |info| switch (info.layout) {
                 .Auto => @compileError("Invalid C struct type: " ++ @typeName(ZigType)),
-                .Packed => try emit_enum(&buffer, ZigType, info, c_name, "1 << {d}", &.{"padding"}),
+                .Packed => try emit_enum(&buffer, ZigType, info, c_name, &.{"padding"}),
                 .Extern => try emit_struct(&buffer, info, c_name),
             },
             .Enum => |info| {
@@ -174,7 +181,7 @@ pub fn main() !void {
                     skip = &.{ "reserved", "root", "register" };
                 }
 
-                try emit_enum(&buffer, ZigType, info, c_name, "{d}", skip);
+                try emit_enum(&buffer, ZigType, info, c_name, skip);
             },
             else => try buffer.writer().print("typedef {s} {s}; \n\n", .{
                 resolve_c_type(ZigType),
@@ -189,7 +196,7 @@ pub fn main() !void {
     try buffer.writer().print(
         \\TB_STATUS tb_client_init(
         \\    tb_client_t* out_client,
-        \\    uint32_t cluster_id,
+        \\    tb_uint128_t cluster_id,
         \\    const char* address_ptr,
         \\    uint32_t address_len,
         \\    uint32_t packets_count,
@@ -199,7 +206,7 @@ pub fn main() !void {
         \\
         \\TB_STATUS tb_client_init_echo(
         \\    tb_client_t* out_client,
-        \\    uint32_t cluster_id,
+        \\    tb_uint128_t cluster_id,
         \\    const char* address_ptr,
         \\    uint32_t address_len,
         \\    uint32_t packets_count,

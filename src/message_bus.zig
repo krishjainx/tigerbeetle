@@ -22,11 +22,13 @@ pub const MessageBusReplica = MessageBusType(.replica);
 pub const MessageBusClient = MessageBusType(.client);
 
 fn MessageBusType(comptime process_type: vsr.ProcessType) type {
-    const SendQueue = RingBuffer(*Message, switch (process_type) {
-        .replica => constants.connection_send_queue_max_replica,
-        // A client has at most 1 in-flight request, plus pings.
-        .client => constants.connection_send_queue_max_client,
-    }, .array);
+    const SendQueue = RingBuffer(*Message, .{
+        .array = switch (process_type) {
+            .replica => constants.connection_send_queue_max_replica,
+            // A client has at most 1 in-flight request, plus pings.
+            .client => constants.connection_send_queue_max_client,
+        },
+    });
 
     const tcp_sndbuf = switch (process_type) {
         .replica => constants.tcp_sndbuf_replica,
@@ -44,7 +46,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
         pool: *MessagePool,
         io: *IO,
 
-        cluster: u32,
+        cluster: u128,
         configuration: []const std.net.Address,
 
         process: switch (process_type) {
@@ -52,6 +54,11 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                 replica: u8,
                 /// The file descriptor for the process on which to accept connections.
                 accept_fd: os.socket_t,
+                /// Address the accept_fd is bound to, as reported by `getsockname`.
+                ///
+                /// This allows passing port 0 as an address for the OS to pick an open port for us
+                /// in a TOCTOU immune way and logging the resulting port number.
+                accept_address: std.net.Address,
                 accept_completion: IO.Completion = undefined,
                 /// The connection reserved for the currently in progress accept operation.
                 /// This is non-null exactly when an accept operation is submitted.
@@ -66,7 +73,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
         },
 
         /// The callback to be called when a message is received.
-        on_message_callback: fn (message_bus: *Self, message: *Message) void,
+        on_message_callback: *const fn (message_bus: *Self, message: *Message) void,
 
         /// This slice is allocated with a fixed size in the init function and never reallocated.
         connections: []Connection,
@@ -92,10 +99,10 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
         /// Initialize the MessageBus for the given cluster, configuration and replica/client process.
         pub fn init(
             allocator: mem.Allocator,
-            cluster: u32,
+            cluster: u128,
             process: Process,
             message_pool: *MessagePool,
-            on_message_callback: fn (message_bus: *Self, message: *Message) void,
+            on_message_callback: *const fn (message_bus: *Self, message: *Message) void,
             options: Options,
         ) !Self {
             // There must be enough connections for all replicas and at least one client.
@@ -104,19 +111,19 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
 
             const connections = try allocator.alloc(Connection, constants.connections_max);
             errdefer allocator.free(connections);
-            mem.set(Connection, connections, .{});
+            @memset(connections, .{});
 
             const replicas = try allocator.alloc(?*Connection, options.configuration.len);
             errdefer allocator.free(replicas);
-            mem.set(?*Connection, replicas, null);
+            @memset(replicas, null);
 
             const replicas_connect_attempts = try allocator.alloc(u64, options.configuration.len);
             errdefer allocator.free(replicas_connect_attempts);
-            mem.set(u64, replicas_connect_attempts, 0);
+            @memset(replicas_connect_attempts, 0);
 
             const prng_seed = switch (process_type) {
                 .replica => process.replica,
-                .client => @truncate(u64, process.client),
+                .client => @as(u64, @truncate(process.client)),
             };
 
             var bus: Self = .{
@@ -125,9 +132,13 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                 .cluster = cluster,
                 .configuration = options.configuration,
                 .process = switch (process_type) {
-                    .replica => .{
-                        .replica = process.replica,
-                        .accept_fd = try init_tcp(options.io, options.configuration[process.replica]),
+                    .replica => blk: {
+                        const tcp = try init_tcp(options.io, options.configuration[process.replica]);
+                        break :blk .{
+                            .replica = process.replica,
+                            .accept_fd = tcp.fd,
+                            .accept_address = tcp.address,
+                        };
                     },
                     .client => {},
                 },
@@ -161,7 +172,10 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
             allocator.free(bus.replicas_connect_attempts);
         }
 
-        fn init_tcp(io: *IO, address: std.net.Address) !os.socket_t {
+        fn init_tcp(io: *IO, address: std.net.Address) !struct {
+            fd: os.socket_t,
+            address: std.net.Address,
+        } {
             const fd = try io.open_socket(
                 address.any.family,
                 os.SOCK.STREAM,
@@ -225,9 +239,17 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
 
             try set(fd, os.SOL.SOCKET, os.SO.REUSEADDR, 1);
             try os.bind(fd, &address.any, address.getOsSockLen());
+
+            // Resolve port 0 to an actual port picked by the OS.
+            var address_resolved: std.net.Address = .{ .any = undefined };
+            var addrlen: os.socklen_t = @sizeOf(std.net.Address);
+            try os.getsockname(fd, &address_resolved.any, &addrlen);
+            assert(address_resolved.getOsSockLen() == addrlen);
+            assert(address_resolved.any.family == address.any.family);
+
             try os.listen(fd, constants.tcp_backlog);
 
-            return fd;
+            return .{ .fd = fd, .address = address_resolved };
         }
 
         pub fn tick(bus: *Self) void {
@@ -349,11 +371,17 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
             bus.process.accept_connection.?.on_accept(bus, fd);
         }
 
-        pub fn get_message(bus: *Self) *Message {
-            return bus.pool.get_message();
+        pub fn get_message(
+            bus: *Self,
+            comptime command: ?vsr.Command,
+        ) MessagePool.GetMessageType(command) {
+            return bus.pool.get_message(command);
         }
 
-        pub fn unref(bus: *Self, message: *Message) void {
+        /// `@TypeOf(message)` is one of:
+        /// - `*Message`
+        /// - `MessageType(command)` for any `command`.
+        pub fn unref(bus: *Self, message: anytype) void {
             bus.pool.unref(message);
         }
 
@@ -442,7 +470,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
             /// Number of bytes of the current message that have already been sent.
             send_progress: usize = 0,
             /// The queue of messages to send to the client or replica peer.
-            send_queue: SendQueue = .{},
+            send_queue: SendQueue = SendQueue.init(),
 
             /// Attempt to connect to a replica.
             /// The slot in the Message.replicas slices is immediately reserved.
@@ -485,7 +513,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                     on_connect_with_exponential_backoff,
                     // We use `recv_completion` for the connection `timeout()` and `connect()` calls
                     &connection.recv_completion,
-                    @intCast(u63, ms * std.time.ns_per_ms),
+                    @as(u63, @intCast(ms * std.time.ns_per_ms)),
                 );
             }
 
@@ -681,10 +709,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                     return null;
                 }
 
-                const header = mem.bytesAsValue(
-                    Header,
-                    @alignCast(@alignOf(Header), data[0..@sizeOf(Header)]),
-                );
+                const header: *const Header = @alignCast(mem.bytesAsValue(Header, data[0..@sizeOf(Header)]));
 
                 if (!connection.recv_checked_header) {
                     if (!header.valid_checksum()) {
@@ -758,7 +783,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                 // `references` and `header` metadata.
                 if (connection.recv_progress == header.size) return connection.recv_message.?.ref();
 
-                const message = bus.get_message();
+                const message = bus.get_message(null);
                 stdx.copy_disjoint(.inexact, u8, message.buffer, data[0..header.size]);
                 return message;
             }
@@ -781,7 +806,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                     if (message.header.size != sector_ceil) {
                         assert(message.header.size < sector_ceil);
                         assert(message.buffer.len == constants.message_size_max);
-                        mem.set(u8, message.buffer[message.header.size..sector_ceil], 0);
+                        @memset(message.buffer[message.header.size..sector_ceil], 0);
                     }
                 }
 
@@ -801,8 +826,8 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
 
                 const header_peer: Connection.Peer = switch (header.peer_type()) {
                     .unknown => return true,
-                    .replica => .{ .replica = header.replica },
-                    .client => .{ .client = header.client },
+                    .replica => |replica| .{ .replica = replica },
+                    .client => |client| .{ .client = client },
                 };
 
                 if (connection.peer != .unknown) {
@@ -852,7 +877,7 @@ fn MessageBusType(comptime process_type: vsr.ProcessType) type {
                     return;
                 }
 
-                const new_message = bus.get_message();
+                const new_message = bus.get_message(null);
                 defer bus.unref(new_message);
 
                 if (connection.recv_message) |recv_message| {

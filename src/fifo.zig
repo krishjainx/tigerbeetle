@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const constants = @import("./constants.zig");
 const tracer = @import("./tracer.zig");
 
 /// An intrusive first in/first out linked list.
@@ -16,6 +17,8 @@ pub fn FIFO(comptime T: type) type {
         name: ?[]const u8,
 
         pub fn push(self: *Self, elem: *T) void {
+            if (constants.verify) assert(!self.contains(elem));
+
             assert(elem.next == null);
             if (self.in) |in| {
                 in.next = elem;
@@ -39,12 +42,25 @@ pub fn FIFO(comptime T: type) type {
             return ret;
         }
 
+        pub fn peek_last(self: Self) ?*T {
+            return self.in;
+        }
+
         pub fn peek(self: Self) ?*T {
             return self.out;
         }
 
         pub fn empty(self: Self) bool {
             return self.peek() == null;
+        }
+
+        /// Returns whether the linked list contains the given *exact element* (pointer comparison).
+        pub fn contains(self: *const Self, elem_needle: *const T) bool {
+            var iterator = self.peek();
+            while (iterator) |elem| : (iterator = elem.next) {
+                if (elem == elem_needle) return true;
+            }
+            return false;
         }
 
         /// Remove an element from the FIFO. Asserts that the element is
@@ -76,14 +92,14 @@ pub fn FIFO(comptime T: type) type {
             if (self.name) |name| {
                 tracer.plot(
                     .{ .queue_count = .{ .queue_name = name } },
-                    @intToFloat(f64, self.count),
+                    @as(f64, @floatFromInt(self.count)),
                 );
             }
         }
     };
 }
 
-test "push/pop/peek/remove/empty" {
+test "FIFO: push/pop/peek/remove/empty" {
     const testing = @import("std").testing;
 
     const Foo = struct { next: ?*@This() = null };
@@ -98,11 +114,17 @@ test "push/pop/peek/remove/empty" {
     fifo.push(&one);
     try testing.expect(!fifo.empty());
     try testing.expectEqual(@as(?*Foo, &one), fifo.peek());
+    try testing.expect(fifo.contains(&one));
+    try testing.expect(!fifo.contains(&two));
+    try testing.expect(!fifo.contains(&three));
 
     fifo.push(&two);
     fifo.push(&three);
     try testing.expect(!fifo.empty());
     try testing.expectEqual(@as(?*Foo, &one), fifo.peek());
+    try testing.expect(fifo.contains(&one));
+    try testing.expect(fifo.contains(&two));
+    try testing.expect(fifo.contains(&three));
 
     fifo.remove(&one);
     try testing.expect(!fifo.empty());
@@ -110,6 +132,9 @@ test "push/pop/peek/remove/empty" {
     try testing.expectEqual(@as(?*Foo, &three), fifo.pop());
     try testing.expectEqual(@as(?*Foo, null), fifo.pop());
     try testing.expect(fifo.empty());
+    try testing.expect(!fifo.contains(&one));
+    try testing.expect(!fifo.contains(&two));
+    try testing.expect(!fifo.contains(&three));
 
     fifo.push(&one);
     fifo.push(&two);

@@ -3,7 +3,6 @@ package com.tigerbeetle;
 import java.lang.annotation.Native;
 import java.nio.ByteBuffer;
 import java.util.Objects;
-import static com.tigerbeetle.AssertionError.assertTrue;
 
 abstract class Request<TResponse extends Batch> {
 
@@ -33,6 +32,7 @@ abstract class Request<TResponse extends Batch> {
         CREATE_TRANSFERS(129),
         LOOKUP_ACCOUNTS(130),
         LOOKUP_TRANSFERS(131),
+        GET_ACCOUNT_TRANSFERS(132),
 
         ECHO_ACCOUNTS(128),
         ECHO_TRANSFERS(129);
@@ -46,10 +46,13 @@ abstract class Request<TResponse extends Batch> {
 
     // Used ony by the JNI side
     @Native
-    private final ByteBuffer buffer;
+    private final ByteBuffer sendBuffer;
 
     @Native
-    private final long bufferLen;
+    private final long sendBufferLen;
+
+    @Native
+    private byte[] replyBuffer;
 
     private final NativeClient nativeClient;
     private final Operations operation;
@@ -63,10 +66,11 @@ abstract class Request<TResponse extends Batch> {
         this.nativeClient = nativeClient;
         this.operation = operation;
         this.requestLen = batch.getLength();
-        this.buffer = batch.getBuffer();
-        this.bufferLen = batch.getBufferLen();
+        this.sendBuffer = batch.getBuffer();
+        this.sendBufferLen = batch.getBufferLen();
+        this.replyBuffer = null;
 
-        if (this.bufferLen == 0 || this.requestLen == 0)
+        if (this.sendBufferLen == 0 || this.requestLen == 0)
             throw new IllegalArgumentException("Empty batch");
     }
 
@@ -77,8 +81,7 @@ abstract class Request<TResponse extends Batch> {
     // Unchecked: Since we just support a limited set of operations, it is safe to cast the
     // result to T[]
     @SuppressWarnings("unchecked")
-    void endRequest(final byte receivedOperation, final ByteBuffer buffer, final long packet,
-            final byte status) {
+    void endRequest(final byte receivedOperation, final byte status) {
 
         // This method is called from the JNI side, on the tb_client thread
         // We CAN'T throw any exception here, any event must be stored and
@@ -95,10 +98,6 @@ abstract class Request<TResponse extends Batch> {
                         new AssertionError("Unexpected callback operation: expected=%d, actual=%d",
                                 operation.value, receivedOperation);
 
-            } else if (packet == 0) {
-
-                exception = new AssertionError("Unexpected callback packet: packet=null");
-
             } else if (status != PacketStatus.Ok.value) {
 
                 exception = new RequestException(status);
@@ -107,28 +106,38 @@ abstract class Request<TResponse extends Batch> {
 
                 switch (operation) {
                     case CREATE_ACCOUNTS: {
-                        result = buffer == null ? CreateAccountResultBatch.EMPTY
-                                : new CreateAccountResultBatch(memcpy(buffer));
+                        result = replyBuffer == null ? CreateAccountResultBatch.EMPTY
+                                : new CreateAccountResultBatch(ByteBuffer.wrap(replyBuffer));
+                        checkResultLength(result);
                         break;
                     }
 
                     case CREATE_TRANSFERS: {
-                        result = buffer == null ? CreateTransferResultBatch.EMPTY
-                                : new CreateTransferResultBatch(memcpy(buffer));
+                        result = replyBuffer == null ? CreateTransferResultBatch.EMPTY
+                                : new CreateTransferResultBatch(ByteBuffer.wrap(replyBuffer));
+                        checkResultLength(result);
                         break;
                     }
 
                     case ECHO_ACCOUNTS:
                     case LOOKUP_ACCOUNTS: {
-                        result = buffer == null ? AccountBatch.EMPTY
-                                : new AccountBatch(memcpy(buffer));
+                        result = replyBuffer == null ? AccountBatch.EMPTY
+                                : new AccountBatch(ByteBuffer.wrap(replyBuffer));
+                        checkResultLength(result);
                         break;
                     }
 
                     case ECHO_TRANSFERS:
                     case LOOKUP_TRANSFERS: {
-                        result = buffer == null ? TransferBatch.EMPTY
-                                : new TransferBatch(memcpy(buffer));
+                        result = replyBuffer == null ? TransferBatch.EMPTY
+                                : new TransferBatch(ByteBuffer.wrap(replyBuffer));
+                        checkResultLength(result);
+                        break;
+                    }
+
+                    case GET_ACCOUNT_TRANSFERS: {
+                        result = replyBuffer == null ? TransferBatch.EMPTY
+                                : new TransferBatch(ByteBuffer.wrap(replyBuffer));
                         break;
                     }
 
@@ -142,40 +151,31 @@ abstract class Request<TResponse extends Batch> {
             exception = any;
         }
 
-        if (exception != null) {
-            setException(exception);
+        if (exception == null) {
+            setResult((TResponse) result);
         } else {
-
-            if (result.getLength() > requestLen) {
-
-                setException(new AssertionError(
-                        "Amount of results is greater than the amount of requests: resultLen=%d, requestLen=%d",
-                        result.getLength(), requestLen));
-            } else {
-                setResult((TResponse) result);
-            }
+            setException(exception);
         }
     }
 
-    byte getOperation() {
-        return this.operation.value;
+    final void checkResultLength(Batch result) {
+        if (result.getLength() > requestLen) {
+            setException(new AssertionError(
+                    "Amount of results is greater than the amount of requests: resultLen=%d, requestLen=%d",
+                    result.getLength(), requestLen));
+        }
     }
 
-    /**
-     * Copies the message buffer memory to managed memory.
-     */
-    static ByteBuffer memcpy(final ByteBuffer source) {
+    // Unused: Used by unit tests.
+    @SuppressWarnings("unused")
+    void setReplyBuffer(byte[] buffer) {
+        this.replyBuffer = buffer;
+    }
 
-        assertTrue(source != null, "Source buffer cannot be null");
-        assertTrue(source.isDirect(), "Source buffer must be direct");
-
-        final var capacity = source.capacity();
-        assertTrue(capacity > 0, "Source buffer cannot be empty");
-
-        final var copy = ByteBuffer.allocate(capacity);
-        copy.put(source);
-
-        return copy.position(0).asReadOnlyBuffer();
+    // Unused: Used by the JNI side.
+    @SuppressWarnings("unused")
+    byte getOperation() {
+        return this.operation.value;
     }
 
     protected abstract void setResult(final TResponse result);

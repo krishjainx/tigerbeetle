@@ -1,9 +1,14 @@
 const assert = require("assert");
 
-const { createClient, TransferFlags } = require("tigerbeetle-node");
+const {
+    createClient,
+    CreateAccountError,
+    CreateTransferError,
+    TransferFlags,
+} = require("tigerbeetle-node");
 
 const client = createClient({
-  cluster_id: 0,
+  cluster_id: 0n,
   replica_addresses: [process.env.TB_ADDRESS || '3000'],
 });
 
@@ -12,50 +17,61 @@ async function main() {
   let accountErrors = await client.createAccounts([
     {
       id: 1n,
-      user_data: 0n,
-      reserved: Buffer.alloc(48, 0),
-      ledger: 1,
-      code: 1,
-      flags: 0,
       debits_pending: 0n,
       debits_posted: 0n,
       credits_pending: 0n,
       credits_posted: 0n,
+      user_data_128: 0n,
+      user_data_64: 0n,
+      user_data_32: 0,
+      reserved: 0,
+      ledger: 1,
+      code: 1,
+      flags: 0,
       timestamp: 0n,
     },
     {
       id: 2n,
-      user_data: 0n,
-      reserved: Buffer.alloc(48, 0),
-      ledger: 1,
-      code: 1,
-      flags: 0,
       debits_pending: 0n,
       debits_posted: 0n,
       credits_pending: 0n,
       credits_posted: 0n,
+      user_data_128: 0n,
+      user_data_64: 0n,
+      user_data_32: 0,
+      reserved: 0,
+      ledger: 1,
+      code: 1,
+      flags: 0,
       timestamp: 0n,
     },
   ]);
+  for (const error of accountErrors) {
+    console.error(`Batch account at ${error.index} failed to create: ${CreateAccountError[error.result]}.`);
+  }
   assert.equal(accountErrors.length, 0);
 
   // Start a pending transfer
   let transferErrors = await client.createTransfers([
     {
       id: 1n,
-      pending_id: 0n,
       debit_account_id: 1n,
       credit_account_id: 2n,
-      user_data: 0n,
-      reserved: 0n,
-      timeout: 0n,
+      amount: 500n,
+      pending_id: 0n,
+      user_data_128: 0n,
+      user_data_64: 0n,
+      user_data_32: 0,
+      timeout: 0,
       ledger: 1,
       code: 1,
       flags: TransferFlags.pending,
       timestamp: 0n,
-      amount: 500n,
     },
   ]);
+  for (const error of transferErrors) {
+    console.error(`Batch transfer at ${error.index} failed to create: ${CreateTransferError[error.result]}.`);
+  }
   assert.equal(transferErrors.length, 0);
 
   // Validate accounts pending and posted debits/credits before finishing the two-phase transfer
@@ -81,19 +97,23 @@ async function main() {
   transferErrors = await client.createTransfers([
     {
       id: 2n,
-      pending_id: 1n,
       debit_account_id: 1n,
       credit_account_id: 2n,
-      user_data: 0n,
-      reserved: 0n,
-      timeout: 0n,
+      amount: 500n,
+      pending_id: 1n,
+      user_data_128: 0n,
+      user_data_64: 0n,
+      user_data_32: 0,
+      timeout: 0,
       ledger: 1,
       code: 1,
       flags: TransferFlags.post_pending_transfer,
       timestamp: 0n,
-      amount: 500n,
     },
   ]);
+  for (const error of transferErrors) {
+    console.error(`Batch transfer at ${error.index} failed to create: ${CreateTransferError[error.result]}.`);
+  }
   assert.equal(transferErrors.length, 0);
 
   // Validate the contents of all transfers

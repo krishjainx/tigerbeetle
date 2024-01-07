@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.fuzz_vsr_superblock_quorums);
 
 const constants = @import("../constants.zig");
+const vsr = @import("../vsr.zig");
 
 const superblock = @import("./superblock.zig");
 const SuperBlockHeader = superblock.SuperBlockHeader;
@@ -12,10 +13,7 @@ const fuzz = @import("../testing/fuzz.zig");
 const superblock_quorums = @import("superblock_quorums.zig");
 const QuorumsType = superblock_quorums.QuorumsType;
 
-pub const tigerbeetle_config = @import("../config.zig").configs.test_min;
-
-pub fn main() !void {
-    const fuzz_args = try fuzz.parse_fuzz_args(std.testing.allocator);
+pub fn main(fuzz_args: fuzz.FuzzArgs) !void {
     var prng = std.rand.DefaultPrng.init(fuzz_args.seed);
 
     // TODO When there is a top-level fuzz.zig main(), split these fuzzers into two different
@@ -104,7 +102,7 @@ pub fn fuzz_quorums_working(random: std.rand.Random) !void {
 fn test_quorums_working(
     random: std.rand.Random,
     threshold_count: u8,
-    copies: *[4]CopyTemplate,
+    initial_copies: *const [4]CopyTemplate,
     result: QuorumsType(.{ .superblock_copies = 4 }).Error!u64,
 ) !void {
     const Quorums = QuorumsType(.{ .superblock_copies = 4 });
@@ -115,27 +113,34 @@ fn test_quorums_working(
     // "checksums[i] orelse random.int(u128)", but that currently causes the compiler to segfault
     // during code generation.
     var checksums: [6]u128 = undefined;
-    for (checksums) |*c| c.* = random.int(u128);
+    for (&checksums) |*c| c.* = random.int(u128);
 
-    var members = [_]u128{0} ** constants.nodes_max;
+    var members = [_]u128{0} ** constants.members_max;
     for (members[0..6]) |*member| {
         member.* = random.int(u128);
     }
 
     // Create headers in ascending-sequence order to build the checksum/parent hash chain.
-    std.sort.sort(CopyTemplate, copies, {}, CopyTemplate.less_than);
+    var initial_templates = initial_copies.*;
+    const copies = &initial_templates;
+    std.mem.sort(CopyTemplate, copies, {}, CopyTemplate.less_than);
 
-    for (headers) |*header, i| {
+    for (&headers, 0..) |*header, i| {
         header.* = std.mem.zeroInit(SuperBlockHeader, .{
-            .copy = @intCast(u8, i),
+            .copy = @as(u8, @intCast(i)),
             .version = SuperBlockVersion,
-            .storage_size_max = superblock.data_file_size_min,
             .sequence = copies[i].sequence,
             .parent = checksums[copies[i].sequence - 1],
             .vsr_state = std.mem.zeroInit(SuperBlockHeader.VSRState, .{
                 .replica_id = members[1],
                 .members = members,
                 .replica_count = 6,
+                .checkpoint = std.mem.zeroInit(SuperBlockHeader.CheckpointState, .{
+                    .commit_min_checksum = 123,
+                    .free_set_checksum = vsr.checksum(&.{}),
+                    .client_sessions_checksum = vsr.checksum(&.{}),
+                    .storage_size = superblock.data_file_size_min,
+                }),
             }),
         });
 
@@ -153,7 +158,8 @@ fn test_quorums_working(
                     checksum = random.int(u128);
                 }
             },
-            .invalid_fork => header.storage_size_max += 1, // Ensure we have a different checksum.
+            // Ensure we have a different checksum.
+            .invalid_fork => header.vsr_state.checkpoint.free_set_size += 1,
             .invalid_parent => header.parent += 1,
             .invalid_misdirect => {
                 if (misdirect) {
@@ -260,23 +266,25 @@ pub fn fuzz_quorum_repairs(
     var q1: Quorums = undefined;
     var q2: Quorums = undefined;
 
-    var members = [_]u128{0} ** constants.nodes_max;
+    var members = [_]u128{0} ** constants.members_max;
     for (members[0..6]) |*member| {
         member.* = random.int(u128);
     }
 
     const headers_valid = blk: {
         var headers: [superblock_copies]SuperBlockHeader = undefined;
-        for (&headers) |*header, i| {
+        for (&headers, 0..) |*header, i| {
             header.* = std.mem.zeroInit(SuperBlockHeader, .{
-                .copy = @intCast(u8, i),
+                .copy = @as(u8, @intCast(i)),
                 .version = SuperBlockVersion,
-                .storage_size_max = superblock.data_file_size_min,
                 .sequence = 123,
                 .vsr_state = std.mem.zeroInit(SuperBlockHeader.VSRState, .{
                     .replica_id = members[1],
                     .members = members,
                     .replica_count = 6,
+                    .checkpoint = std.mem.zeroInit(SuperBlockHeader.CheckpointState, .{
+                        .commit_min_checksum = 123,
+                    }),
                 }),
             });
 
@@ -300,7 +308,7 @@ pub fn fuzz_quorum_repairs(
     }
 
     var working_headers: [superblock_copies]SuperBlockHeader = undefined;
-    for (&working_headers) |*header, i| {
+    for (&working_headers, 0..) |*header, i| {
         header.* = if (valid.isSet(i)) headers_valid[i] else header_invalid;
     }
     random.shuffle(SuperBlockHeader, &working_headers);

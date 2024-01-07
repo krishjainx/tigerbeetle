@@ -28,7 +28,7 @@
 //! † When A's value is a tombstone, there is a special case for garbage collection. When either:
 //! * level B is the final level, or
 //! * A's key does not exist in B or any deeper level,
-//! then the tombstone is omitted from the compacted output (see: `compaction_must_drop_tombstones`).
+//! then the tombstone is omitted from the compacted output, see: `compaction_must_drop_tombstones`.
 //!
 const std = @import("std");
 const mem = std.mem;
@@ -42,12 +42,16 @@ const tracer = @import("../tracer.zig");
 const constants = @import("../constants.zig");
 
 const stdx = @import("../stdx.zig");
-const GridType = @import("grid.zig").GridType;
-const allocate_block = @import("grid.zig").allocate_block;
-const TableInfoType = @import("manifest.zig").TableInfoType;
+const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtr = @import("../vsr/grid.zig").BlockPtr;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
+const allocate_block = @import("../vsr/grid.zig").allocate_block;
+const TableInfoType = @import("manifest.zig").TreeTableInfoType;
 const ManifestType = @import("manifest.zig").ManifestType;
+const schema = @import("schema.zig");
 const TableDataIteratorType = @import("table_data_iterator.zig").TableDataIteratorType;
-const LevelTableValueBlockIteratorType = @import("level_data_iterator.zig").LevelTableValueBlockIteratorType;
+const LevelTableValueBlockIteratorType =
+    @import("level_data_iterator.zig").LevelTableValueBlockIteratorType;
 
 pub fn CompactionType(
     comptime Table: type,
@@ -58,8 +62,6 @@ pub fn CompactionType(
         const Compaction = @This();
 
         const Grid = GridType(Storage);
-        const BlockPtr = Grid.BlockPtr;
-        const BlockPtrConst = Grid.BlockPtrConst;
 
         const TableInfo = TableInfoType(Table);
         const Manifest = ManifestType(Table, Storage);
@@ -69,7 +71,6 @@ pub fn CompactionType(
 
         const Key = Table.Key;
         const Value = Table.Value;
-        const compare_keys = Table.compare_keys;
         const key_from_value = Table.key_from_value;
         const tombstone = Table.tombstone;
 
@@ -94,7 +95,7 @@ pub fn CompactionType(
             table_info_a: TableInfoA,
             level_b: u8,
             range_b: CompactionRange,
-            callback: fn (*Compaction) void,
+            callback: *const fn (*Compaction) void,
         };
 
         const InputLevel = enum(u1) {
@@ -103,20 +104,20 @@ pub fn CompactionType(
         };
 
         // Passed by `init`.
-        tree_name: []const u8,
+        tree_config: Tree.Config,
 
         // Allocated during `init`.
         iterator_a: TableDataIterator,
         iterator_b: LevelTableValueBlockIterator,
+        table_builder: Table.Builder,
         index_block_a: BlockPtr,
         index_block_b: BlockPtr,
         data_blocks: [2]BlockPtr,
-        table_builder: Table.Builder,
         last_keys_in: [2]?Key = .{ null, null },
 
         /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
         /// they are applied deterministically relative to other concurrent compactions.
-        manifest_entries: std.BoundedArray(struct {
+        manifest_entries: stdx.BoundedArray(struct {
             operation: enum {
                 insert_to_level_b,
                 move_to_level_b,
@@ -129,7 +130,7 @@ pub fn CompactionType(
             count += constants.lsm_growth_factor + 1; // Insert the output tables to level B.
             // (In the move-table case, only a single TableInfo is inserted, and none are updated.)
             break :manifest_entries_max count;
-        }) = .{ .buffer = undefined },
+        }) = .{},
 
         // Passed by `start`.
         context: Context,
@@ -162,17 +163,16 @@ pub fn CompactionType(
         next_tick: Grid.NextTick = undefined,
         read: Grid.Read = undefined,
         write_data_block: Grid.Write = undefined,
-        write_filter_block: Grid.Write = undefined,
         write_index_block: Grid.Write = undefined,
 
         tracer_slot: ?tracer.SpanStart,
         iterator_tracer_slot: ?tracer.SpanStart,
 
-        pub fn init(allocator: Allocator, tree_name: []const u8) !Compaction {
-            var iterator_a = try TableDataIterator.init();
+        pub fn init(allocator: Allocator, tree_config: Tree.Config) !Compaction {
+            var iterator_a = TableDataIterator.init();
             errdefer iterator_a.deinit();
 
-            var iterator_b = try LevelTableValueBlockIterator.init();
+            var iterator_b = LevelTableValueBlockIterator.init();
             errdefer iterator_b.deinit();
 
             const index_block_a = try allocate_block(allocator);
@@ -181,7 +181,7 @@ pub fn CompactionType(
             const index_block_b = try allocate_block(allocator);
             errdefer allocator.free(index_block_b);
 
-            var data_blocks: [2]Grid.BlockPtr = undefined;
+            var data_blocks: [2]BlockPtr = undefined;
 
             data_blocks[0] = try allocate_block(allocator);
             errdefer allocator.free(data_blocks[0]);
@@ -193,7 +193,7 @@ pub fn CompactionType(
             errdefer table_builder.deinit(allocator);
 
             return Compaction{
-                .tree_name = tree_name,
+                .tree_config = tree_config,
 
                 .iterator_a = iterator_a,
                 .iterator_b = iterator_b,
@@ -226,13 +226,51 @@ pub fn CompactionType(
         }
 
         pub fn reset(compaction: *Compaction) void {
+            compaction.* = .{
+                .tree_config = compaction.tree_config,
+
+                .iterator_a = compaction.iterator_a,
+                .iterator_b = compaction.iterator_b,
+                .index_block_a = compaction.index_block_a,
+                .index_block_b = compaction.index_block_b,
+                .data_blocks = compaction.data_blocks,
+                .table_builder = compaction.table_builder,
+
+                .context = undefined,
+                .move_table = undefined,
+                .grid_reservation = null,
+                .drop_tombstones = undefined,
+
+                .values_in = .{ &.{}, &.{} },
+
+                .input_state = .remaining,
+                .state = .idle,
+
+                .tracer_slot = null,
+                .iterator_tracer_slot = null,
+            };
+
+            compaction.iterator_a.reset();
+            compaction.iterator_b.reset();
+            compaction.table_builder.reset();
+
+            // Zero the blocks because allocate_block() returns a zeroed block.
+            @memset(compaction.index_block_a, 0);
+            @memset(compaction.index_block_b, 0);
+            for (compaction.data_blocks) |data_block| {
+                @memset(data_block, 0);
+            }
+        }
+
+        pub fn transition_to_idle(compaction: *Compaction) void {
             assert(compaction.state == .applied_to_manifest);
 
             compaction.state = .idle;
-            compaction.manifest_entries.len = 0;
             if (compaction.grid_reservation) |grid_reservation| {
                 compaction.context.grid.forfeit(grid_reservation);
                 compaction.grid_reservation = null;
+            } else {
+                assert(compaction.move_table);
             }
         }
 
@@ -245,12 +283,11 @@ pub fn CompactionType(
         ) void {
             assert(compaction.state == .idle);
             assert(compaction.grid_reservation == null);
-            assert(compaction.manifest_entries.len == 0);
 
             tracer.start(
                 &compaction.tracer_slot,
                 .{ .tree_compaction = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = context.level_b,
                 } },
                 @src(),
@@ -258,7 +295,7 @@ pub fn CompactionType(
 
             const move_table =
                 context.table_info_a == .disk and
-                context.range_b.tables.len == 0;
+                context.range_b.tables.empty();
 
             // Reserve enough blocks to write our output tables in the worst case, where:
             // - no tombstones are dropped,
@@ -277,7 +314,7 @@ pub fn CompactionType(
             else
                 // +1 to count the input table from level A.
                 context.grid.reserve(
-                    (context.range_b.tables.len + 1) * Table.block_count_max,
+                    (context.range_b.tables.count() + 1) * Table.block_count_max,
                 ).?;
 
             // Levels may choose to drop tombstones if keys aren't included in the lower levels.
@@ -289,7 +326,7 @@ pub fn CompactionType(
             assert(drop_tombstones or context.level_b < constants.lsm_levels - 1);
 
             compaction.* = .{
-                .tree_name = compaction.tree_name,
+                .tree_config = compaction.tree_config,
 
                 .iterator_a = compaction.iterator_a,
                 .iterator_b = compaction.iterator_b,
@@ -317,14 +354,14 @@ pub fn CompactionType(
 
                 log.debug(
                     "{s}: Moving table: level_b={}",
-                    .{ compaction.tree_name, context.level_b },
+                    .{ compaction.tree_config.name, context.level_b },
                 );
 
                 const snapshot_max = snapshot_max_for_table_input(context.op_min);
                 const table_a = context.table_info_a.disk.table_info;
                 assert(table_a.snapshot_max >= snapshot_max);
 
-                compaction.manifest_entries.appendAssumeCapacity(.{
+                compaction.manifest_entries.append_assume_capacity(.{
                     .operation = .move_to_level_b,
                     .table = table_a.*,
                 });
@@ -336,30 +373,30 @@ pub fn CompactionType(
 
                 log.debug(
                     "{s}: Merging table: level_b={}",
-                    .{ compaction.tree_name, context.level_b },
+                    .{ compaction.tree_config.name, context.level_b },
                 );
 
                 compaction.iterator_b.start(.{
                     .grid = context.grid,
                     .level = context.level_b,
                     .snapshot = context.op_min,
-                    .tables = context.range_b.tables,
+                    .tables = .{ .compaction = compaction.context.range_b.tables.const_slice() },
                     .index_block = compaction.index_block_b,
+                    .direction = .ascending,
                 });
 
                 switch (context.table_info_a) {
-                    .immutable => |values| {
-                        compaction.values_in[0] = values;
+                    .immutable => {
                         compaction.loop_start();
                     },
                     .disk => |table_ref| {
                         compaction.state = .iterator_init_a;
                         compaction.context.grid.read_block(
-                            on_iterator_init_a,
+                            .{ .from_local_or_global_storage = on_iterator_init_a },
                             &compaction.read,
                             table_ref.table_info.address,
                             table_ref.table_info.checksum,
-                            .index,
+                            .{ .cache_read = true, .cache_write = true },
                         );
                     },
                 }
@@ -369,14 +406,18 @@ pub fn CompactionType(
         fn on_iterator_init_a(read: *Grid.Read, index_block: BlockPtrConst) void {
             const compaction = @fieldParentPtr(Compaction, "read", read);
             assert(compaction.state == .iterator_init_a);
+            assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
 
             // `index_block` is only valid for this callback, so copy its contents.
             // TODO(jamii) This copy can be avoided if we bypass the cache.
             stdx.copy_disjoint(.exact, u8, compaction.index_block_a, index_block);
+
+            const index_schema_a = schema.TableIndex.from(compaction.index_block_a);
             compaction.iterator_a.start(.{
                 .grid = compaction.context.grid,
-                .addresses = Table.index_data_addresses_used(compaction.index_block_a),
-                .checksums = Table.index_data_checksums_used(compaction.index_block_a),
+                .addresses = index_schema_a.data_addresses_used(compaction.index_block_a),
+                .checksums = index_schema_a.data_checksums_used(compaction.index_block_a),
+                .direction = .ascending,
             });
             compaction.release_table_blocks(compaction.index_block_a);
             compaction.state = .compacting;
@@ -389,7 +430,7 @@ pub fn CompactionType(
             tracer.start(
                 &compaction.iterator_tracer_slot,
                 .{ .tree_compaction_iter = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = compaction.context.level_b,
                 } },
                 @src(),
@@ -402,11 +443,26 @@ pub fn CompactionType(
         fn iterator_check(compaction: *Compaction, input_level: InputLevel) void {
             assert(compaction.state == .compacting);
 
-            if (compaction.values_in[@enumToInt(input_level)].len > 0) {
+            if (compaction.values_in[@intFromEnum(input_level)].len > 0) {
                 // Still have values on this input_level, no need to refill.
                 compaction.iterator_check_finish(input_level);
             } else if (input_level == .a and compaction.context.table_info_a == .immutable) {
-                // No iterator to call next on.
+                // Potentially fill our immutable values from the immutable TableMemory.
+                // TODO: Currently, this copies the values to compaction.data_blocks[0], but in
+                // future we can make it use a KWayMergeIterator.
+                if (compaction.context.table_info_a.immutable.len > 0) {
+                    var target = Table.data_block_values(compaction.data_blocks[0]);
+
+                    const filled = compaction.fill_immutable_values(target);
+                    assert(filled <= target.len);
+                    if (filled == 0) assert(Table.usage == .secondary_index);
+
+                    // The immutable table is always considered "Table A", which maps to 0.
+                    compaction.values_in[0] = target[0..filled];
+                } else {
+                    assert(compaction.values_in[0].len == 0);
+                }
+
                 compaction.iterator_check_finish(input_level);
             } else {
                 compaction.state = .{ .iterator_next = input_level };
@@ -420,10 +476,96 @@ pub fn CompactionType(
             }
         }
 
-        fn on_index_block(iterator_b: *LevelTableValueBlockIterator) void {
+        /// Copies values to `target` from our immutable table input. In the process, merge values
+        /// with identical keys (last one wins) and collapse tombstones for secondary indexes.
+        /// Return the number of values written to the output and updates immutable table slice to
+        /// the non-processed remainder.
+        fn fill_immutable_values(compaction: *Compaction, target: []Value) usize {
+            var source = compaction.context.table_info_a.immutable;
+            assert(source.len > 0);
+
+            if (constants.verify) {
+                // The input may have duplicate keys (last one wins), but keys must be
+                // non-decreasing.
+                // A source length of 1 is always non-decreasing.
+                for (source[0 .. source.len - 1], source[1..source.len]) |*value, *value_next| {
+                    assert(key_from_value(value) <= key_from_value(value_next));
+                }
+            }
+
+            var source_index: usize = 0;
+            var target_index: usize = 0;
+            while (target_index < target.len and source_index < source.len) {
+                target[target_index] = source[source_index];
+
+                // If we're at the end of the source, there is no next value, so the next value
+                // can't be equal.
+                const value_next_equal = source_index + 1 < source.len and
+                    key_from_value(&source[source_index]) ==
+                    key_from_value(&source[source_index + 1]);
+
+                if (value_next_equal) {
+                    if (Table.usage == .secondary_index) {
+                        // Secondary index optimization --- cancel out put and remove.
+                        // NB: while this prevents redundant tombstones from getting to disk, we
+                        // still spend some extra CPU work to sort the entries in memory. Ideally,
+                        // we annihilate tombstones immediately, before sorting, but that's tricky
+                        // to do with scopes.
+                        assert(tombstone(&source[source_index]) !=
+                            tombstone(&source[source_index + 1]));
+                        source_index += 2;
+                        target_index += 0;
+                    } else {
+                        // The last value in a run of duplicates needs to be the one that ends up in
+                        // target.
+                        source_index += 1;
+                        target_index += 0;
+                    }
+                } else {
+                    source_index += 1;
+                    target_index += 1;
+                }
+            }
+
+            // At this point, source_index and target_index are actually counts.
+            // source_index will always be incremented after the final iteration as part of the
+            // continue expression.
+            // target_index will always be incremented, since either source_index runs out first
+            // so value_next_equal is false, or a new value is hit, which will increment it.
+            const source_count = source_index;
+            const target_count = target_index;
+            assert(target_count <= source_count);
+            compaction.context.table_info_a.immutable =
+                compaction.context.table_info_a.immutable[source_count..];
+
+            if (target_count == 0) {
+                assert(Table.usage == .secondary_index);
+                return 0;
+            }
+
+            if (constants.verify) {
+                // Our output must be strictly increasing.
+                // An output length of 1 is always strictly increasing.
+                for (
+                    target[0 .. target_count - 1],
+                    target[1..target_count],
+                ) |*value, *value_next| {
+                    assert(key_from_value(value_next) > key_from_value(value));
+                }
+            }
+
+            assert(target_count > 0);
+            return target_count;
+        }
+
+        fn on_index_block(
+            iterator_b: *LevelTableValueBlockIterator,
+        ) LevelTableValueBlockIterator.DataBlocksToLoad {
             const compaction = @fieldParentPtr(Compaction, "iterator_b", iterator_b);
             assert(std.meta.eql(compaction.state, .{ .iterator_next = .b }));
             compaction.release_table_blocks(compaction.index_block_b);
+
+            return .all;
         }
 
         // TODO: Support for LSM snapshots would require us to only remove blocks
@@ -435,22 +577,24 @@ pub fn CompactionType(
             // a copy of the index block for the Level A table being compacted.
 
             const grid = compaction.context.grid;
-            for (Table.index_data_addresses_used(index_block)) |address| {
-                grid.release(address);
-            }
-            for (Table.index_filter_addresses_used(index_block)) |address| {
-                grid.release(address);
-            }
+            const index_schema = schema.TableIndex.from(index_block);
+            for (index_schema.data_addresses_used(index_block)) |address| grid.release(address);
             grid.release(Table.block_address(index_block));
         }
 
-        fn iterator_next_a(iterator_a: *TableDataIterator, data_block: ?BlockPtrConst) void {
+        fn iterator_next_a(
+            iterator_a: *TableDataIterator,
+            data_block: ?BlockPtrConst,
+        ) void {
             const compaction = @fieldParentPtr(Compaction, "iterator_a", iterator_a);
             assert(std.meta.eql(compaction.state, .{ .iterator_next = .a }));
             compaction.iterator_next(data_block);
         }
 
-        fn iterator_next_b(iterator_b: *LevelTableValueBlockIterator, data_block: ?BlockPtrConst) void {
+        fn iterator_next_b(
+            iterator_b: *LevelTableValueBlockIterator,
+            data_block: ?BlockPtrConst,
+        ) void {
             const compaction = @fieldParentPtr(Compaction, "iterator_b", iterator_b);
             assert(std.meta.eql(compaction.state, .{ .iterator_next = .b }));
             compaction.iterator_next(data_block);
@@ -459,7 +603,7 @@ pub fn CompactionType(
         fn iterator_next(compaction: *Compaction, data_block: ?BlockPtrConst) void {
             assert(compaction.state == .iterator_next);
             const input_level = compaction.state.iterator_next;
-            const index = @enumToInt(input_level);
+            const index = @intFromEnum(input_level);
 
             if (data_block) |block| {
                 // `data_block` is only valid for this callback, so copy its contents.
@@ -470,17 +614,21 @@ pub fn CompactionType(
 
                 // Assert that we're reading data blocks in key order.
                 const values_in = compaction.values_in[index];
-                if (values_in.len > 0) {
-                    const first_key = key_from_value(&values_in[0]);
-                    const last_key = key_from_value(&values_in[values_in.len - 1]);
-                    if (compaction.last_keys_in[index]) |last_key_prev| {
-                        assert(compare_keys(last_key_prev, first_key) == .lt);
+                assert(values_in.len > 0);
+                if (constants.verify) {
+                    for (values_in[0 .. values_in.len - 1], values_in[1..]) |*value, *value_next| {
+                        assert(key_from_value(value) < key_from_value(value_next));
                     }
-                    if (values_in.len > 1) {
-                        assert(compare_keys(first_key, last_key) == .lt);
-                    }
-                    compaction.last_keys_in[index] = last_key;
                 }
+                const first_key = key_from_value(&values_in[0]);
+                const last_key = key_from_value(&values_in[values_in.len - 1]);
+                if (compaction.last_keys_in[index]) |last_key_prev| {
+                    assert(last_key_prev < first_key);
+                }
+                if (values_in.len > 1) {
+                    assert(first_key < last_key);
+                }
+                compaction.last_keys_in[index] = last_key;
             } else {
                 // If no more data blocks available, just leave `values_in[index]` empty.
             }
@@ -506,7 +654,7 @@ pub fn CompactionType(
             tracer.start(
                 &tracer_slot,
                 .{ .tree_compaction_merge = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = compaction.context.level_b,
                 } },
                 @src(),
@@ -529,7 +677,7 @@ pub fn CompactionType(
             tracer.end(
                 &tracer_slot,
                 .{ .tree_compaction_merge = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = compaction.context.level_b,
                 } },
             );
@@ -539,16 +687,16 @@ pub fn CompactionType(
 
         fn copy(compaction: *Compaction, input_level: InputLevel) void {
             assert(compaction.state == .compacting);
-            assert(compaction.values_in[@enumToInt(input_level) +% 1].len == 0);
+            assert(compaction.values_in[@intFromEnum(input_level) +% 1].len == 0);
             assert(compaction.table_builder.value_count < Table.layout.block_value_count_max);
 
-            const values_in = compaction.values_in[@enumToInt(input_level)];
+            const values_in = compaction.values_in[@intFromEnum(input_level)];
             const values_out = compaction.table_builder.data_block_values();
             var values_out_index = compaction.table_builder.value_count;
 
             assert(values_in.len > 0);
 
-            const len = @minimum(values_in.len, values_out.len - values_out_index);
+            const len = @min(values_in.len, values_out.len - values_out_index);
             assert(len > 0);
             stdx.copy_disjoint(
                 .exact,
@@ -557,8 +705,8 @@ pub fn CompactionType(
                 values_in[0..len],
             );
 
-            compaction.values_in[@enumToInt(input_level)] = values_in[len..];
-            compaction.table_builder.value_count += @intCast(u32, len);
+            compaction.values_in[@intFromEnum(input_level)] = values_in[len..];
+            compaction.table_builder.value_count += @as(u32, @intCast(len));
         }
 
         fn copy_drop_tombstones(compaction: *Compaction) void {
@@ -577,8 +725,10 @@ pub fn CompactionType(
                 values_out_index < values_out.len)
             {
                 const value_a = &values_in_a[values_in_a_index];
+
                 values_in_a_index += 1;
                 if (tombstone(value_a)) {
+                    assert(Table.usage != .secondary_index);
                     continue;
                 }
                 values_out[values_out_index] = value_a.*;
@@ -610,12 +760,13 @@ pub fn CompactionType(
             {
                 const value_a = &values_in_a[values_in_a_index];
                 const value_b = &values_in_b[values_in_b_index];
-                switch (compare_keys(key_from_value(value_a), key_from_value(value_b))) {
+                switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
                     .lt => {
                         values_in_a_index += 1;
                         if (compaction.drop_tombstones and
                             tombstone(value_a))
                         {
+                            assert(Table.usage != .secondary_index);
                             continue;
                         }
                         values_out[values_out_index] = value_a.*;
@@ -629,20 +780,17 @@ pub fn CompactionType(
                     .eq => {
                         values_in_a_index += 1;
                         values_in_b_index += 1;
+
                         if (Table.usage == .secondary_index) {
-                            if (tombstone(value_a)) {
-                                assert(!tombstone(value_b));
-                                continue;
-                            }
-                            if (tombstone(value_b)) {
-                                assert(!tombstone(value_a));
-                                continue;
-                            }
+                            // Secondary index optimization --- cancel out put and remove.
+                            assert(tombstone(value_a) != tombstone(value_b));
+                            continue;
                         } else if (compaction.drop_tombstones) {
                             if (tombstone(value_a)) {
                                 continue;
                             }
                         }
+
                         values_out[values_out_index] = value_a.*;
                         values_out_index += 1;
                     },
@@ -664,9 +812,6 @@ pub fn CompactionType(
 
             // Flush the data block if needed.
             if (table_builder.data_block_full() or
-                // If the filter or index blocks need to be flushed,
-                // the data block has to be flushed first.
-                table_builder.filter_block_full() or
                 table_builder.index_block_full() or
                 // If the input is exhausted then we need to flush all blocks before finishing.
                 (input_exhausted and !table_builder.data_block_empty()))
@@ -674,23 +819,10 @@ pub fn CompactionType(
                 table_builder.data_block_finish(.{
                     .cluster = compaction.context.grid.superblock.working.cluster,
                     .address = compaction.context.grid.acquire(compaction.grid_reservation.?),
+                    .snapshot_min = snapshot_min_for_table_output(compaction.context.op_min),
+                    .tree_id = compaction.tree_config.id,
                 });
                 WriteBlock(.data).write_block(compaction);
-            }
-
-            // Flush the filter block if needed.
-            if (table_builder.filter_block_full() or
-                // If the index block need to be flushed,
-                // the filter block has to be flushed first.
-                table_builder.index_block_full() or
-                // If the input is exhausted then we need to flush all blocks before finishing.
-                (input_exhausted and !table_builder.filter_block_empty()))
-            {
-                table_builder.filter_block_finish(.{
-                    .cluster = compaction.context.grid.superblock.working.cluster,
-                    .address = compaction.context.grid.acquire(compaction.grid_reservation.?),
-                });
-                WriteBlock(.filter).write_block(compaction);
             }
 
             // Flush the index block if needed.
@@ -702,9 +834,10 @@ pub fn CompactionType(
                     .cluster = compaction.context.grid.superblock.working.cluster,
                     .address = compaction.context.grid.acquire(compaction.grid_reservation.?),
                     .snapshot_min = snapshot_min_for_table_output(compaction.context.op_min),
+                    .tree_id = compaction.tree_config.id,
                 });
                 // Make this table visible at the end of this half-bar.
-                compaction.manifest_entries.appendAssumeCapacity(.{
+                compaction.manifest_entries.append_assume_capacity(.{
                     .operation = .insert_to_level_b,
                     .table = table,
                 });
@@ -716,7 +849,7 @@ pub fn CompactionType(
             }
         }
 
-        const WriteBlockField = enum { data, filter, index };
+        const WriteBlockField = enum { data, index };
         fn WriteBlock(comptime write_block_field: WriteBlockField) type {
             return struct {
                 fn write_block(compaction: *Compaction) void {
@@ -724,21 +857,14 @@ pub fn CompactionType(
 
                     const write = switch (write_block_field) {
                         .data => &compaction.write_data_block,
-                        .filter => &compaction.write_filter_block,
                         .index => &compaction.write_index_block,
                     };
                     const block = switch (write_block_field) {
                         .data => &compaction.table_builder.data_block,
-                        .filter => &compaction.table_builder.filter_block,
                         .index => &compaction.table_builder.index_block,
                     };
                     compaction.state.tables_writing.pending += 1;
-                    compaction.context.grid.write_block(
-                        on_write,
-                        write,
-                        block,
-                        Table.block_address(block.*),
-                    );
+                    compaction.context.grid.create_block(on_write, write, block);
                 }
 
                 fn on_write(write: *Grid.Write) void {
@@ -746,7 +872,6 @@ pub fn CompactionType(
                         Compaction,
                         switch (write_block_field) {
                             .data => "write_data_block",
-                            .filter => "write_filter_block",
                             .index => "write_index_block",
                         },
                         write,
@@ -767,7 +892,7 @@ pub fn CompactionType(
             tracer.end(
                 &compaction.iterator_tracer_slot,
                 .{ .tree_compaction_iter = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = compaction.context.level_b,
                 } },
             );
@@ -802,7 +927,7 @@ pub fn CompactionType(
             tracer.end(
                 &compaction.tracer_slot,
                 .{ .tree_compaction = .{
-                    .tree_name = compaction.tree_name,
+                    .tree_name = compaction.tree_config.name,
                     .level_b = compaction.context.level_b,
                 } },
             );
@@ -815,45 +940,34 @@ pub fn CompactionType(
             assert(compaction.state == .tables_writing_done);
             compaction.state = .applied_to_manifest;
 
-            // Each compaction's manifest (log) updates are deferred to the end of the last
-            // half-beat to ensure they are ordered deterministically relative to one
-            // another.
-            // TODO: If compaction is sequential, deferring manifest updates is unnecessary.
+            // Each compaction's manifest updates are deferred to the end of the last
+            // half-beat to ensure:
+            // - manifest log updates are ordered deterministically relative to one another, and
+            // - manifest updates are not visible until after the blocks are all on disk.
             const manifest = &compaction.context.tree.manifest;
             const level_b = compaction.context.level_b;
             const snapshot_max = snapshot_max_for_table_input(compaction.context.op_min);
 
-            // Update snapshot_max only if table in level A has been compacted
-            // with tables from level B. If no compaction is required, i.e.
-            // if a table in level A can simply be moved to level B, we needn't
-            // update snapshot_max.
-            // This update MUST be done before insert_table() and move_table()
-            // since it directly uses pointers to the ManifestLevel tables to
-            // perform updates. Calling insert_table() and move_table() before
-            // this update will cause these pointers to become invalid.
-            if (!compaction.move_table) {
+            if (compaction.move_table) {
+                // If no compaction is required, don't update snapshot_max.
+            } else {
+                // These updates MUST precede insert_table() and move_table() since they use
+                // references to modify the ManifestLevel in-place.
                 switch (compaction.context.table_info_a) {
                     .immutable => {},
                     .disk => |table_info| {
                         manifest.update_table(level_b - 1, snapshot_max, table_info);
                     },
                 }
-                for (compaction.context.range_b.tables.slice()) |table| {
+                for (compaction.context.range_b.tables.const_slice()) |table| {
                     manifest.update_table(level_b, snapshot_max, table);
                 }
             }
 
             for (compaction.manifest_entries.slice()) |*entry| {
                 switch (entry.operation) {
-                    .insert_to_level_b => manifest.insert_table(
-                        level_b,
-                        &entry.table,
-                    ),
-                    .move_to_level_b => manifest.move_table(
-                        level_b - 1,
-                        level_b,
-                        &entry.table,
-                    ),
+                    .insert_to_level_b => manifest.insert_table(level_b, &entry.table),
+                    .move_to_level_b => manifest.move_table(level_b - 1, level_b, &entry.table),
                 }
             }
         }
@@ -861,11 +975,11 @@ pub fn CompactionType(
 }
 
 fn snapshot_max_for_table_input(op_min: u64) u64 {
-    assert(op_min % @divExact(constants.lsm_batch_multiple, 2) == 0);
-    return op_min + @divExact(constants.lsm_batch_multiple, 2) - 1;
+    return snapshot_min_for_table_output(op_min) - 1;
 }
 
-fn snapshot_min_for_table_output(op_min: u64) u64 {
+pub fn snapshot_min_for_table_output(op_min: u64) u64 {
+    assert(op_min > 0);
     assert(op_min % @divExact(constants.lsm_batch_multiple, 2) == 0);
     return op_min + @divExact(constants.lsm_batch_multiple, 2);
 }

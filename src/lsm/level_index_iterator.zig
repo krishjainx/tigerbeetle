@@ -7,7 +7,8 @@ const constants = @import("../constants.zig");
 
 const Direction = @import("direction.zig").Direction;
 const ManifestType = @import("manifest.zig").ManifestType;
-const GridType = @import("grid.zig").GridType;
+const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
 
 /// A LevelIndexIterator iterates the index blocks of every table in a key range in ascending key order.
 pub fn LevelIndexIteratorType(comptime Table: type, comptime Storage: type) type {
@@ -15,7 +16,6 @@ pub fn LevelIndexIteratorType(comptime Table: type, comptime Storage: type) type
         const LevelIndexIterator = @This();
         const Key = Table.Key;
         const Grid = GridType(Storage);
-        const BlockPtrConst = Grid.BlockPtrConst;
         const Manifest = ManifestType(Table, Storage);
         const TableInfo = Manifest.TableInfo;
 
@@ -68,6 +68,14 @@ pub fn LevelIndexIteratorType(comptime Table: type, comptime Storage: type) type
             it.* = undefined;
         }
 
+        pub fn reset(it: *LevelIndexIterator) void {
+            it.* = .{
+                .context = undefined,
+                .key_exclusive = null,
+                .callback = .none,
+            };
+        }
+
         pub fn start(it: *LevelIndexIterator, context: Context) void {
             assert(it.callback == .none);
             if (context.direction == .descending) {
@@ -111,11 +119,11 @@ pub fn LevelIndexIteratorType(comptime Table: type, comptime Storage: type) type
                     },
                 };
                 it.context.grid.read_block(
-                    on_read,
+                    .{ .from_local_or_global_storage = on_read },
                     &it.read,
                     table_info.address,
                     table_info.checksum,
-                    .index,
+                    .{ .cache_read = true, .cache_write = true },
                 );
             } else {
                 it.callback = .{ .next_tick = callback };
@@ -123,7 +131,7 @@ pub fn LevelIndexIteratorType(comptime Table: type, comptime Storage: type) type
             }
         }
 
-        fn on_read(read: *Grid.Read, block: Grid.BlockPtrConst) void {
+        fn on_read(read: *Grid.Read, block: BlockPtrConst) void {
             const it = @fieldParentPtr(LevelIndexIterator, "read", read);
             assert(it.callback == .read);
 

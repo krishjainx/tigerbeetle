@@ -2,6 +2,7 @@ const std = @import("std");
 const math = std.math;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 const log = std.log.scoped(.vsr);
 
 // vsr.zig is the root of a zig package, reexport all public APIs.
@@ -16,36 +17,48 @@ pub const storage = @import("storage.zig");
 pub const tigerbeetle = @import("tigerbeetle.zig");
 pub const time = @import("time.zig");
 pub const tracer = @import("tracer.zig");
-pub const config = @import("config.zig");
 pub const stdx = @import("stdx.zig");
+pub const flags = @import("flags.zig");
 pub const superblock = @import("vsr/superblock.zig");
 pub const aof = @import("aof.zig");
 pub const lsm = .{
     .tree = @import("lsm/tree.zig"),
-    .grid = @import("lsm/grid.zig"),
     .groove = @import("lsm/groove.zig"),
     .forest = @import("lsm/forest.zig"),
-    .posted_groove = @import("lsm/posted_groove.zig"),
 };
 pub const testing = .{
     .cluster = @import("testing/cluster.zig"),
 };
 
 pub const ReplicaType = @import("vsr/replica.zig").ReplicaType;
+pub const ReplicaEvent = @import("vsr/replica.zig").ReplicaEvent;
 pub const format = @import("vsr/replica_format.zig").format;
 pub const Status = @import("vsr/replica.zig").Status;
+pub const SyncStage = @import("vsr/sync.zig").Stage;
+pub const SyncTarget = @import("vsr/sync.zig").Target;
+pub const SyncTargetCandidate = @import("vsr/sync.zig").TargetCandidate;
+pub const SyncTargetQuorum = @import("vsr/sync.zig").TargetQuorum;
 pub const Client = @import("vsr/client.zig").Client;
 pub const ClockType = @import("vsr/clock.zig").ClockType;
+pub const GridType = @import("vsr/grid.zig").GridType;
 pub const JournalType = @import("vsr/journal.zig").JournalType;
+pub const ClientSessions = @import("vsr/client_sessions.zig").ClientSessions;
 pub const ClientRepliesType = @import("vsr/client_replies.zig").ClientRepliesType;
 pub const SlotRange = @import("vsr/journal.zig").SlotRange;
 pub const SuperBlockType = superblock.SuperBlockType;
+pub const SuperBlockManifestReferences = superblock.ManifestReferences;
+pub const SuperBlockTrailerReference = superblock.TrailerReference;
 pub const VSRState = superblock.SuperBlockHeader.VSRState;
+pub const CheckpointState = superblock.SuperBlockHeader.CheckpointState;
 pub const checksum = @import("vsr/checksum.zig").checksum;
+pub const ChecksumStream = @import("vsr/checksum.zig").ChecksumStream;
+pub const Header = @import("vsr/message_header.zig").Header;
+pub const FreeSet = @import("vsr/free_set.zig").FreeSet;
+pub const CheckpointTrailerType = @import("vsr/checkpoint_trailer.zig").CheckpointTrailerType;
 
 /// The version of our Viewstamped Replication protocol in use, including customizations.
 /// For backwards compatibility through breaking changes (e.g. upgrading checksums/ciphers).
-pub const Version: u8 = 0;
+pub const Version: u16 = 0;
 
 pub const ProcessType = enum { replica, client };
 
@@ -54,12 +67,25 @@ pub const Zone = enum {
     wal_headers,
     wal_prepares,
     client_replies,
+    // Add padding between `client_replies` and `grid`, to make sure grid blocks are aligned to
+    // block size and not just to sector size. Aligning blocks this way makes it more likely that
+    // they are aligned to the underlying physical sector size. This padding is zeroed during
+    // format, but isn't used otherwise.
+    grid_padding,
     grid,
 
     const size_superblock = superblock.superblock_zone_size;
     const size_wal_headers = constants.journal_size_headers;
     const size_wal_prepares = constants.journal_size_prepares;
     const size_client_replies = constants.client_replies_size;
+    const size_grid_padding = size_grid_padding: {
+        const grid_start_unaligned = size_superblock +
+            size_wal_headers +
+            size_wal_prepares +
+            size_client_replies;
+        const grid_start_aligned = std.mem.alignForward(usize, grid_start_unaligned, constants.block_size);
+        break :size_grid_padding grid_start_aligned - grid_start_unaligned;
+    };
 
     comptime {
         for (.{
@@ -67,9 +93,15 @@ pub const Zone = enum {
             size_wal_headers,
             size_wal_prepares,
             size_client_replies,
+            size_grid_padding,
         }) |zone_size| {
             assert(zone_size % constants.sector_size == 0);
         }
+
+        for (std.enums.values(Zone)) |zone| {
+            assert(Zone.start(zone) % constants.sector_size == 0);
+        }
+        assert(Zone.start(.grid) % constants.block_size == 0);
     }
 
     pub fn offset(zone: Zone, offset_logical: u64) u64 {
@@ -95,41 +127,80 @@ pub const Zone = enum {
             .wal_headers => size_wal_headers,
             .wal_prepares => size_wal_prepares,
             .client_replies => size_client_replies,
+            .grid_padding => size_grid_padding,
             .grid => null,
         };
     }
+
+    /// Ensures that the read or write is aligned correctly for Direct I/O.
+    /// If this is not the case, then the underlying syscall will return EINVAL.
+    /// We check this only at the start of a read or write because the physical sector size may be
+    /// less than our logical sector size so that partial IOs then leave us no longer aligned.
+    pub fn verify_iop(zone: Zone, buffer: []const u8, offset_in_zone: u64) void {
+        if (zone.size()) |zone_size| {
+            assert(offset_in_zone + buffer.len <= zone_size);
+        }
+        assert(@intFromPtr(buffer.ptr) % constants.sector_size == 0);
+        assert(buffer.len % constants.sector_size == 0);
+        assert(buffer.len > 0);
+        const offset_in_storage = zone.offset(offset_in_zone);
+        assert(offset_in_storage % constants.sector_size == 0);
+        if (zone == .grid) assert(offset_in_storage % constants.block_size == 0);
+    }
+};
+
+/// Reference to a single block in the grid.
+///
+/// Blocks are always referred to by a pair of an address and a checksum to protect from misdirected
+/// reads and writes: checksum inside the block itself doesn't help if the disk accidentally reads a
+/// wrong block.
+///
+/// Block addresses start from one, such that zeroed-out memory can not be confused with a valid
+/// address.
+pub const BlockReference = struct {
+    checksum: u128,
+    address: u64,
 };
 
 /// Viewstamped Replication protocol commands:
 pub const Command = enum(u8) {
-    reserved,
+    reserved = 0,
 
-    ping,
-    pong,
+    ping = 1,
+    pong = 2,
 
-    ping_client,
-    pong_client,
+    ping_client = 3,
+    pong_client = 4,
 
-    request,
-    prepare,
-    prepare_ok,
-    reply,
-    commit,
+    request = 5,
+    prepare = 6,
+    prepare_ok = 7,
+    reply = 8,
+    commit = 9,
 
-    start_view_change,
-    do_view_change,
-    start_view,
+    start_view_change = 10,
+    do_view_change = 11,
+    start_view = 12,
 
-    request_start_view,
-    request_headers,
-    request_prepare,
-    request_reply,
-    headers,
+    request_start_view = 13,
+    request_headers = 14,
+    request_prepare = 15,
+    request_reply = 16,
+    headers = 17,
 
-    eviction,
+    eviction = 18,
 
-    request_blocks,
-    block,
+    request_blocks = 19,
+    block = 20,
+
+    request_sync_checkpoint = 21,
+    sync_checkpoint = 22,
+
+    comptime {
+        for (std.enums.values(Command), 0..) |result, index| {
+            assert(@intFromEnum(result) == index);
+        }
+    }
 };
 
 /// This type exists to avoid making the Header type dependant on the state
@@ -142,30 +213,32 @@ pub const Operation = enum(u8) {
     root = 1,
     /// The value 2 is reserved to register a client session with the cluster.
     register = 2,
+    /// The value 3 is reserved for reconfiguration request.
+    reconfigure = 3,
 
     /// Operations <vsr_operations_reserved are reserved for the control plane.
     /// Operations ≥vsr_operations_reserved are available for the state machine.
     _,
 
     pub fn from(comptime StateMachine: type, op: StateMachine.Operation) Operation {
-        check_state_machine_operations(StateMachine.Operation);
-        return @intToEnum(Operation, @enumToInt(op));
+        check_state_machine_operations(StateMachine);
+        return @as(Operation, @enumFromInt(@intFromEnum(op)));
     }
 
     pub fn cast(self: Operation, comptime StateMachine: type) StateMachine.Operation {
-        check_state_machine_operations(StateMachine.Operation);
+        check_state_machine_operations(StateMachine);
         assert(self.valid(StateMachine));
-        assert(!self.reserved());
-        return @intToEnum(StateMachine.Operation, @enumToInt(self));
+        assert(!self.vsr_reserved());
+        return @as(StateMachine.Operation, @enumFromInt(@intFromEnum(self)));
     }
 
     pub fn valid(self: Operation, comptime StateMachine: type) bool {
-        check_state_machine_operations(StateMachine.Operation);
+        check_state_machine_operations(StateMachine);
 
         inline for (.{ Operation, StateMachine.Operation }) |Enum| {
             const ops = comptime std.enums.values(Enum);
             inline for (ops) |op| {
-                if (@enumToInt(self) == @enumToInt(op)) {
+                if (@intFromEnum(self) == @intFromEnum(op)) {
                     return true;
                 }
             }
@@ -174,8 +247,8 @@ pub const Operation = enum(u8) {
         return false;
     }
 
-    pub fn reserved(self: Operation) bool {
-        return @enumToInt(self) < constants.vsr_operations_reserved;
+    pub fn vsr_reserved(self: Operation) bool {
+        return @intFromEnum(self) < constants.vsr_operations_reserved;
     }
 
     pub fn tag_name(self: Operation, comptime StateMachine: type) []const u8 {
@@ -183,7 +256,7 @@ pub const Operation = enum(u8) {
         inline for (.{ Operation, StateMachine.Operation }) |Enum| {
             inline for (@typeInfo(Enum).Enum.fields) |field| {
                 const op = @field(Enum, field.name);
-                if (@enumToInt(self) == @enumToInt(op)) {
+                if (@intFromEnum(self) == @intFromEnum(op)) {
                     return field.name;
                 }
             }
@@ -191,612 +264,18 @@ pub const Operation = enum(u8) {
         unreachable;
     }
 
-    fn check_state_machine_operations(comptime Op: type) void {
-        comptime assert(@typeInfo(Op).Enum.is_exhaustive);
-        comptime assert(@sizeOf(Op) == @sizeOf(Operation));
-        comptime assert(@bitSizeOf(Op) == @bitSizeOf(Operation));
-        inline for (@typeInfo(Op).Enum.fields) |field| {
-            const op = @field(Op, field.name);
-            if (@enumToInt(op) < constants.vsr_operations_reserved) {
-                @compileError("StateMachine.Operation is reserved");
+    fn check_state_machine_operations(comptime StateMachine: type) void {
+        comptime {
+            assert(@typeInfo(StateMachine.Operation).Enum.is_exhaustive);
+            assert(@typeInfo(StateMachine.Operation).Enum.tag_type ==
+                @typeInfo(Operation).Enum.tag_type);
+            for (@typeInfo(StateMachine.Operation).Enum.fields) |field| {
+                const op = @field(StateMachine.Operation, field.name);
+                if (@intFromEnum(op) < constants.vsr_operations_reserved) {
+                    @compileError("StateMachine.Operation is reserved");
+                }
             }
         }
-    }
-};
-
-/// Network message and journal entry header:
-/// We reuse the same header for both so that prepare messages from the primary can simply be
-/// journalled as is by the backups without requiring any further modification.
-pub const Header = extern struct {
-    /// Aegis128 (used by checksum) uses hardware accelerated AES via inline asm which isn't
-    /// available at comptime. Use a hard-coded value instead and verify via a test.
-    const checksum_body_empty: u128 = 0x49F174618255402DE6E7E3C40D60CC83;
-    test "empty checksum" {
-        assert(checksum_body_empty == checksum(&.{}));
-    }
-
-    comptime {
-        assert(@sizeOf(Header) == 128);
-        // Assert that there is no implicit padding in the struct.
-        assert(@bitSizeOf(Header) == @sizeOf(Header) * 8);
-    }
-    /// A checksum covering only the remainder of this header.
-    /// This allows the header to be trusted without having to recv() or read() the associated body.
-    /// This checksum is enough to uniquely identify a network message or journal entry.
-    checksum: u128 = 0,
-
-    /// A checksum covering only the associated body after this header.
-    checksum_body: u128 = 0,
-
-    /// A backpointer to the previous request or prepare checksum for hash chain verification.
-    /// This provides a cryptographic guarantee for linearizability:
-    /// 1. across our distributed log of prepares, and
-    /// 2. across a client's requests and our replies.
-    /// This may also be used as the initialization vector for AEAD encryption at rest, provided
-    /// that the primary ratchets the encryption key every view change to ensure that prepares
-    /// reordered through a view change never repeat the same IV for the same encryption key.
-    parent: u128 = 0,
-
-    /// Each client process generates a unique, random and ephemeral client ID at initialization.
-    /// The client ID identifies connections made by the client to the cluster for the sake of
-    /// routing messages back to the client.
-    ///
-    /// With the client ID in hand, the client then registers a monotonically increasing session
-    /// number (committed through the cluster) to allow the client's session to be evicted safely
-    /// from the client table if too many concurrent clients cause the client table to overflow.
-    /// The monotonically increasing session number prevents duplicate client requests from being
-    /// replayed.
-    ///
-    /// The problem of routing is therefore solved by the 128-bit client ID, and the problem of
-    /// detecting whether a session has been evicted is solved by the session number.
-    ///
-    /// * A `request_reply` sets this to the client of the reply being requested.
-    /// * A `do_view_change` sets this to a bitset of "present" prepares. If a bit is set, then
-    ///   the corresponding header is not "blank", the replica has the prepare, and the prepare
-    ///   is not known to be faulty.
-    client: u128 = 0,
-
-    /// The checksum of the message to which this message refers.
-    ///
-    /// We use this cryptographic context in various ways, for example:
-    ///
-    /// * A `request` sets this to the client's session number.
-    /// * A `reply` sets this to a "stable" checksum.
-    ///   Replies for a specific op may have different views (and checksums),
-    ///   but are guaranteed to have the same context.
-    /// * A `prepare` sets this to the checksum of the client's request.
-    /// * A `prepare_ok` sets this to the checksum of the prepare being acked.
-    /// * A `commit` sets this to the checksum of the latest committed prepare.
-    /// * A `do_view_change` sets this to a bitset, with set bits indicating headers
-    ///   in the message body which it has definitely not prepared (i.e. "nack").
-    ///   The corresponding header may be an actual prepare header, or it may be a "blank" header.
-    /// * A `request_start_view` sets this to a unique nonce, to detect outdated SVs.
-    /// * A `start_view` sets this to zero for a new view, and to a nonce from an RSV when
-    ///   responding to the RSV.
-    /// * A `request_prepare` sets this to the checksum of the prepare being requested.
-    /// * A `request_reply` sets this to the checksum of the reply being requested.
-    ///
-    /// This allows for cryptographic guarantees beyond request, op, and commit numbers, which have
-    /// low entropy and may otherwise collide in the event of any correctness bugs.
-    context: u128 = 0,
-
-    /// Each request is given a number by the client and later requests must have larger numbers
-    /// than earlier ones. The request number is used by the replicas to avoid running requests more
-    /// than once; it is also used by the client to discard duplicate responses to its requests.
-    /// A client is allowed to have at most one request inflight at a time.
-    ///
-    /// * A `do_view_change` sets this to its latest log_view number.
-    request: u32 = 0,
-
-    /// The cluster number binds intention into the header, so that a client or replica can indicate
-    /// the cluster it believes it is speaking to, instead of accidentally talking to the wrong
-    /// cluster (for example, staging vs production).
-    cluster: u32,
-
-    /// The cluster reconfiguration epoch number (for future use).
-    epoch: u32 = 0,
-
-    /// Every message sent from one replica to another contains the sending replica's current view.
-    /// A `u32` allows for a minimum lifetime of 136 years at a rate of one view change per second.
-    view: u32 = 0,
-
-    /// The op number of the latest prepare that may or may not yet be committed. Uncommitted ops
-    /// may be replaced by different ops if they do not survive through a view change.
-    ///
-    /// * A `request_headers` sets this to the maximum op requested (inclusive).
-    /// * A `request_prepare` sets this to the requested op.
-    /// * A `request_reply` sets this to the requested op.
-    op: u64 = 0,
-
-    /// The commit number of the latest committed prepare. Committed ops are immutable.
-    ///
-    /// * A `do_view_change` sets this to `commit_min`, to indicate the sending replica's progress.
-    ///   The sending replica may continue to commit after sending the DVC.
-    /// * A `start_view` sets this to `commit_min`/`commit_max` (they are the same).
-    /// * A `request_headers` sets this to the minimum op requested (inclusive).
-    commit: u64 = 0,
-
-    /// This field is used in various ways:
-    ///
-    /// * A `prepare` sets this to the primary's state machine `prepare_timestamp`.
-    ///   For `create_accounts` and `create_transfers` this is the batch's highest timestamp.
-    /// * A `reply` sets this to the corresponding `prepare`'s timestamp.
-    ///   This allows the test workload to verify transfer timeouts.
-    /// * A `pong` sets this to the sender's wall clock value.
-    /// * A `commit` message sets this to the replica's monotonic timestamp.
-    /// * A `do_view_change` and `start_view` set this to the replica's `op_checkpoint`.
-    timestamp: u64 = 0,
-
-    /// The size of the Header structure (always), plus any associated body.
-    size: u32 = @sizeOf(Header),
-
-    /// The index of the replica in the cluster configuration array that authored this message.
-    /// This identifies only the ultimate author because messages may be forwarded amongst replicas.
-    replica: u8 = 0,
-
-    /// The Viewstamped Replication protocol command for this message.
-    command: Command,
-
-    /// The state machine operation to apply.
-    operation: Operation = .reserved,
-
-    /// The version of the protocol implementation that originated this message.
-    version: u8 = Version,
-
-    pub fn calculate_checksum(self: *const Header) u128 {
-        const checksum_size = @sizeOf(@TypeOf(self.checksum));
-        assert(checksum_size == 16);
-        const checksum_value = checksum(std.mem.asBytes(self)[checksum_size..]);
-        assert(@TypeOf(checksum_value) == @TypeOf(self.checksum));
-        return checksum_value;
-    }
-
-    pub fn calculate_checksum_body(self: *const Header, body: []const u8) u128 {
-        assert(self.size == @sizeOf(Header) + body.len);
-        const checksum_size = @sizeOf(@TypeOf(self.checksum_body));
-        assert(checksum_size == 16);
-        const checksum_value = checksum(body);
-        assert(@TypeOf(checksum_value) == @TypeOf(self.checksum_body));
-        return checksum_value;
-    }
-
-    /// This must be called only after set_checksum_body() so that checksum_body is also covered:
-    pub fn set_checksum(self: *Header) void {
-        self.checksum = self.calculate_checksum();
-    }
-
-    pub fn set_checksum_body(self: *Header, body: []const u8) void {
-        self.checksum_body = self.calculate_checksum_body(body);
-    }
-
-    pub fn valid_checksum(self: *const Header) bool {
-        return self.checksum == self.calculate_checksum();
-    }
-
-    pub fn valid_checksum_body(self: *const Header, body: []const u8) bool {
-        return self.checksum_body == self.calculate_checksum_body(body);
-    }
-
-    /// Returns null if all fields are set correctly according to the command, or else a warning.
-    /// This does not verify that checksum is valid, and expects that this has already been done.
-    pub fn invalid(self: *const Header) ?[]const u8 {
-        if (self.version != Version) return "version != Version";
-        if (self.size < @sizeOf(Header)) return "size < @sizeOf(Header)";
-        if (self.epoch != 0) return "epoch != 0";
-        return switch (self.command) {
-            .reserved => self.invalid_reserved(),
-            .ping => self.invalid_ping(),
-            .pong => self.invalid_pong(),
-            .ping_client => self.invalid_ping_client(),
-            .pong_client => self.invalid_pong_client(),
-            .request => self.invalid_request(),
-            .prepare => self.invalid_prepare(),
-            .prepare_ok => self.invalid_prepare_ok(),
-            .reply => self.invalid_reply(),
-            .commit => self.invalid_commit(),
-            .start_view_change => self.invalid_start_view_change(),
-            .do_view_change => self.invalid_do_view_change(),
-            .start_view => self.invalid_start_view(),
-            .request_start_view => self.invalid_request_start_view(),
-            .request_headers => self.invalid_request_headers(),
-            .request_prepare => self.invalid_request_prepare(),
-            .request_reply => self.invalid_request_reply(),
-            .request_blocks => self.invalid_request_blocks(),
-            .headers => self.invalid_headers(),
-            .eviction => self.invalid_eviction(),
-            .block => self.invalid_block(),
-        };
-    }
-
-    fn invalid_reserved(self: *const Header) ?[]const u8 {
-        assert(self.command == .reserved);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.view != 0) return "view != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.replica != 0) return "replica != 0";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_ping(self: *const Header) ?[]const u8 {
-        assert(self.command == .ping);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.view != 0) return "view != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_pong(self: *const Header) ?[]const u8 {
-        assert(self.command == .pong);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.view != 0) return "view != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp == 0) return "timestamp == 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_ping_client(self: *const Header) ?[]const u8 {
-        assert(self.command == .ping_client);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client == 0) return "client == 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.view != 0) return "view != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.replica != 0) return "replica != 0";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_pong_client(self: *const Header) ?[]const u8 {
-        assert(self.command == .pong_client);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request(self: *const Header) ?[]const u8 {
-        assert(self.command == .request);
-        if (self.client == 0) return "client == 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0 and !constants.aof_recovery) return "timestamp != 0";
-        if (self.replica != 0) return "replica != 0";
-        switch (self.operation) {
-            .reserved => return "operation == .reserved",
-            .root => return "operation == .root",
-            .register => {
-                // The first request a client makes must be to register with the cluster:
-                if (self.parent != 0) return "register: parent != 0";
-                if (self.context != 0) return "register: context != 0";
-                if (self.request != 0) return "register: request != 0";
-                // The .register operation carries no payload:
-                if (self.checksum_body != checksum_body_empty) return "register: checksum_body != expected";
-                if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-            },
-            else => {
-                if (@enumToInt(self.operation) < constants.vsr_operations_reserved) {
-                    return "operation is reserved";
-                }
-                // Thereafter, the client must provide the session number in the context:
-                // These requests should set `parent` to the `checksum` of the previous reply.
-                if (self.context == 0) return "context == 0";
-                if (self.request == 0) return "request == 0";
-            },
-        }
-        return null;
-    }
-
-    fn invalid_prepare(self: *const Header) ?[]const u8 {
-        assert(self.command == .prepare);
-        switch (self.operation) {
-            .reserved => return "operation == .reserved",
-            .root => {
-                if (self.parent != 0) return "root: parent != 0";
-                if (self.client != 0) return "root: client != 0";
-                if (self.context != 0) return "root: context != 0";
-                if (self.request != 0) return "root: request != 0";
-                if (self.view != 0) return "root: view != 0";
-                if (self.op != 0) return "root: op != 0";
-                if (self.commit != 0) return "root: commit != 0";
-                if (self.timestamp != 0) return "root: timestamp != 0";
-                if (self.checksum_body != checksum_body_empty) return "root: checksum_body != expected";
-                if (self.size != @sizeOf(Header)) return "root: size != @sizeOf(Header)";
-                if (self.replica != 0) return "root: replica != 0";
-            },
-            else => {
-                if (self.client == 0) return "client == 0";
-                if (self.op == 0) return "op == 0";
-                if (self.op <= self.commit) return "op <= commit";
-                if (self.timestamp == 0) return "timestamp == 0";
-                if (self.operation == .register) {
-                    // Client session numbers are replaced by the reference to the previous prepare.
-                    if (self.request != 0) return "request != 0";
-                } else {
-                    // Client session numbers are replaced by the reference to the previous prepare.
-                    if (self.request == 0) return "request == 0";
-                }
-            },
-        }
-        return null;
-    }
-
-    fn invalid_prepare_ok(self: *const Header) ?[]const u8 {
-        assert(self.command == .prepare_ok);
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        switch (self.operation) {
-            .reserved => return "operation == .reserved",
-            .root => {
-                const root_checksum = Header.root_prepare(self.cluster).checksum;
-                if (self.parent != 0) return "root: parent != 0";
-                if (self.client != 0) return "root: client != 0";
-                if (self.context != root_checksum) return "root: context != expected";
-                if (self.request != 0) return "root: request != 0";
-                if (self.op != 0) return "root: op != 0";
-                if (self.commit != 0) return "root: commit != 0";
-                if (self.timestamp != 0) return "root: timestamp != 0";
-            },
-            else => {
-                if (self.client == 0) return "client == 0";
-                if (self.op == 0) return "op == 0";
-                if (self.op <= self.commit) return "op <= commit";
-                if (self.timestamp == 0) return "timestamp == 0";
-                if (self.operation == .register) {
-                    if (self.request != 0) return "request != 0";
-                } else {
-                    if (self.request == 0) return "request == 0";
-                }
-            },
-        }
-        return null;
-    }
-
-    fn invalid_reply(self: *const Header) ?[]const u8 {
-        assert(self.command == .reply);
-        // Initialization within `client.zig` asserts that client `id` is greater than zero:
-        if (self.client == 0) return "client == 0";
-        if (self.op != self.commit) return "op != commit";
-        if (self.timestamp == 0) return "timestamp == 0";
-        if (self.operation == .register) {
-            // In this context, the commit number is the newly registered session number.
-            // The `0` commit number is reserved for cluster initialization.
-            if (self.commit == 0) return "commit == 0";
-            if (self.request != 0) return "request != 0";
-        } else {
-            if (self.commit == 0) return "commit == 0";
-            if (self.request == 0) return "request == 0";
-        }
-        return null;
-    }
-
-    fn invalid_commit(self: *const Header) ?[]const u8 {
-        assert(self.command == .commit);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.timestamp == 0) return "timestamp == 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_start_view_change(self: *const Header) ?[]const u8 {
-        assert(self.command == .start_view_change);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_do_view_change(self: *const Header) ?[]const u8 {
-        assert(self.command == .do_view_change);
-        if (self.parent != 0) return "parent != 0";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_start_view(self: *const Header) ?[]const u8 {
-        assert(self.command == .start_view);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request_start_view(self: *const Header) ?[]const u8 {
-        assert(self.command == .request_start_view);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request_headers(self: *const Header) ?[]const u8 {
-        assert(self.command == .request_headers);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.commit > self.op) return "op_min > op_max";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request_prepare(self: *const Header) ?[]const u8 {
-        assert(self.command == .request_prepare);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request_reply(self: *const Header) ?[]const u8 {
-        assert(self.command == .request_reply);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client == 0) return "client == 0";
-        if (self.request != 0) return "request != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_request_blocks(self: *const Header) ?[]const u8 {
-        assert(self.command == .request_blocks);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.size == @sizeOf(Header)) return "size == @sizeOf(Header)";
-        if ((self.size - @sizeOf(Header)) % @sizeOf(BlockRequest) != 0) {
-            return "size multiple invalid";
-        }
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_headers(self: *const Header) ?[]const u8 {
-        assert(self.command == .headers);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_eviction(self: *const Header) ?[]const u8 {
-        assert(self.command == .eviction);
-        if (self.parent != 0) return "parent != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.request != 0) return "request != 0";
-        if (self.op != 0) return "op != 0";
-        if (self.commit != 0) return "commit != 0";
-        if (self.timestamp != 0) return "timestamp != 0";
-        if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
-        if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
-        if (self.operation != .reserved) return "operation != .reserved";
-        return null;
-    }
-
-    fn invalid_block(self: *const Header) ?[]const u8 {
-        assert(self.command == .block);
-        if (self.parent != 0) return "parent != 0";
-        if (self.client != 0) return "client != 0";
-        if (self.context != 0) return "context != 0";
-        if (self.view != 0) return "view != 0";
-        if (self.op == 0) return "op == 0"; // address ≠ 0
-        if (self.replica != 0) return "replica != 0";
-        if (self.operation == .reserved) return "operation == .reserved";
-        return null;
-    }
-
-    /// Returns whether the immediate sender is a replica or client (if this can be determined).
-    /// Some commands such as .request or .prepare may be forwarded on to other replicas so that
-    /// Header.replica or Header.client only identifies the ultimate origin, not the latest peer.
-    pub fn peer_type(self: *const Header) enum { unknown, replica, client } {
-        switch (self.command) {
-            .reserved => unreachable,
-            // These messages cannot always identify the peer as they may be forwarded:
-            .request => switch (self.operation) {
-                // However, we do not forward the first .register request sent by a client:
-                .register => return .client,
-                else => return .unknown,
-            },
-            .prepare => return .unknown,
-            // These messages identify the peer as either a replica or a client:
-            .ping_client => return .client,
-            // All other messages identify the peer as a replica:
-            else => return .replica,
-        }
-    }
-
-    pub fn reserved(cluster: u32, slot: u64) Header {
-        assert(slot < constants.journal_slot_count);
-
-        var header = Header{
-            .command = .reserved,
-            .cluster = cluster,
-            .op = slot,
-        };
-        header.set_checksum_body(&[0]u8{});
-        header.set_checksum();
-        assert(header.invalid() == null);
-        return header;
-    }
-
-    pub fn root_prepare(cluster: u32) Header {
-        var header = Header{
-            .cluster = cluster,
-            .size = @sizeOf(Header),
-            .command = .prepare,
-            .operation = .root,
-        };
-        header.set_checksum_body(&[0]u8{});
-        header.set_checksum();
-        assert(header.invalid() == null);
-        return header;
     }
 };
 
@@ -807,9 +286,257 @@ pub const BlockRequest = extern struct {
 
     comptime {
         assert(@sizeOf(BlockRequest) == 32);
-        assert(@bitSizeOf(BlockRequest) == @sizeOf(BlockRequest) * 8);
+        assert(@sizeOf(BlockRequest) <= constants.message_body_size_max);
+        assert(stdx.no_padding(BlockRequest));
     }
 };
+
+/// Body of the builtin operation=.reconfigure request.
+pub const ReconfigurationRequest = extern struct {
+    /// The new list of members.
+    ///
+    /// Request is rejected if it is not a permutation of an existing list of members.
+    /// This is done to separate different failure modes of physically adding a new machine to the
+    /// cluster as opposed to logically changing the set of machines participating in quorums.
+    members: Members,
+    /// The new epoch.
+    ///
+    /// Request is rejected if it isn't exactly current epoch + 1, to protect from operator errors.
+    /// Although there's already an `epoch` field in vsr.Header, we don't want to rely on that for
+    /// reconfiguration itself, as it is updated automatically by the clients, and here we need
+    /// a manual confirmation from the operator.
+    epoch: u32,
+    /// The new replica count.
+    ///
+    /// At the moment, we require this to be equal to the old count.
+    replica_count: u8,
+    /// The new standby count.
+    ///
+    /// At the moment, we require this to be equal to the old count.
+    standby_count: u8,
+    reserved: [54]u8 = [_]u8{0} ** 54,
+    /// The result of this request. Set to zero by the client and filled-in by the primary when it
+    /// accepts a reconfiguration request.
+    result: ReconfigurationResult,
+
+    comptime {
+        assert(@sizeOf(ReconfigurationRequest) == 256);
+        assert(stdx.no_padding(ReconfigurationRequest));
+    }
+
+    pub fn validate(
+        request: *const ReconfigurationRequest,
+        current: struct {
+            members: *const Members,
+            epoch: u32,
+            replica_count: u8,
+            standby_count: u8,
+        },
+    ) ReconfigurationResult {
+        assert(member_count(current.members) == current.replica_count + current.standby_count);
+
+        if (request.replica_count == 0) return .replica_count_zero;
+        if (request.replica_count > constants.replicas_max) return .replica_count_max_exceeded;
+        if (request.standby_count > constants.standbys_max) return .standby_count_max_exceeded;
+
+        if (!valid_members(&request.members)) return .members_invalid;
+        if (member_count(&request.members) != request.replica_count + request.standby_count) {
+            return .members_count_invalid;
+        }
+
+        if (!std.mem.allEqual(u8, &request.reserved, 0)) return .reserved_field;
+        if (request.result != .reserved) return .result_must_be_reserved;
+
+        if (request.replica_count != current.replica_count) return .different_replica_count;
+        if (request.standby_count != current.standby_count) return .different_standby_count;
+
+        if (request.epoch < current.epoch) return .epoch_in_the_past;
+        if (request.epoch == current.epoch) {
+            return if (std.meta.eql(request.members, current.members.*))
+                .configuration_applied
+            else
+                .configuration_conflict;
+        }
+        if (request.epoch - current.epoch > 1) return .epoch_in_the_future;
+
+        assert(request.epoch == current.epoch + 1);
+
+        assert(valid_members(current.members));
+        assert(valid_members(&request.members));
+        assert(member_count(current.members) == member_count(&request.members));
+        // We have just asserted that the sets have no duplicates and have equal lengths,
+        // so it's enough to check that current.members ⊂ request.members.
+        for (current.members) |member_current| {
+            if (member_current == 0) break;
+            for (request.members) |member| {
+                if (member == member_current) break;
+            } else return .different_member_set;
+        }
+
+        if (std.meta.eql(request.members, current.members.*)) {
+            return .configuration_is_no_op;
+        }
+
+        return .ok;
+    }
+};
+
+pub const ReconfigurationResult = enum(u32) {
+    reserved = 0,
+    /// Reconfiguration request is valid.
+    /// The cluster is guaranteed to transition to the new epoch with the specified configuration.
+    ok = 1,
+
+    /// replica_count must be at least 1.
+    replica_count_zero = 2,
+    replica_count_max_exceeded = 3,
+    standby_count_max_exceeded = 4,
+
+    /// The Members array is syntactically invalid --- duplicate entries or internal zero entries.
+    members_invalid = 5,
+    /// The number of non-zero entries in Members array does not match the sum of replica_count
+    /// and standby_count.
+    members_count_invalid = 6,
+
+    /// A reserved field is non-zero.
+    reserved_field = 7,
+    /// result must be set to zero (.reserved).
+    result_must_be_reserved = 8,
+
+    /// epoch is in the past (smaller than the current epoch).
+    epoch_in_the_past = 9,
+    /// epoch is too far in the future (larger than current epoch + 1).
+    epoch_in_the_future = 10,
+
+    /// Reconfiguration changes the number of replicas, that is not currently supported.
+    different_replica_count = 11,
+    /// Reconfiguration changes the number of standbys, that is not currently supported.
+    different_standby_count = 12,
+    /// members must be a permutation of the current set of cluster members.
+    different_member_set = 13,
+
+    /// epoch is equal to the current epoch and configuration is the same.
+    /// This is a duplicate request.
+    configuration_applied = 14,
+    /// epoch is equal to the current epoch but configuration is different.
+    /// A conflicting reconfiguration request was accepted.
+    configuration_conflict = 15,
+    /// The request is valid, but there's no need to advance the epoch, because / configuration
+    /// exactly matches the current one.
+    configuration_is_no_op = 16,
+
+    comptime {
+        for (std.enums.values(ReconfigurationResult), 0..) |result, index| {
+            assert(@intFromEnum(result) == index);
+        }
+    }
+};
+
+test "ReconfigurationRequest" {
+    const ResultSet = std.EnumSet(ReconfigurationResult);
+
+    const Test = struct {
+        members: Members = to_members(.{ 1, 2, 3, 4 }),
+        epoch: u32 = 1,
+        replica_count: u8 = 3,
+        standby_count: u8 = 1,
+
+        tested: ResultSet = ResultSet{},
+
+        fn check(t: *@This(), request: ReconfigurationRequest, expected: ReconfigurationResult) !void {
+            const actual = request.validate(.{
+                .members = &t.members,
+                .epoch = t.epoch,
+                .replica_count = t.replica_count,
+                .standby_count = t.standby_count,
+            });
+
+            try std.testing.expectEqual(expected, actual);
+            t.tested.insert(expected);
+        }
+
+        fn to_members(m: anytype) Members {
+            var result = [_]u128{0} ** constants.members_max;
+            inline for (m, 0..) |member, index| result[index] = member;
+            return result;
+        }
+    };
+
+    var t: Test = .{};
+
+    const r: ReconfigurationRequest = .{
+        .members = Test.to_members(.{ 4, 1, 2, 3 }),
+        .epoch = 2,
+        .replica_count = 3,
+        .standby_count = 1,
+        .result = .reserved,
+    };
+
+    try t.check(r, .ok);
+    try t.check(stdx.update(r, .{ .replica_count = 0 }), .replica_count_zero);
+    try t.check(stdx.update(r, .{ .replica_count = 255 }), .replica_count_max_exceeded);
+    try t.check(
+        stdx.update(r, .{ .standby_count = constants.standbys_max + 1 }),
+        .standby_count_max_exceeded,
+    );
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 4, 1, 4, 3 }) }),
+        .members_invalid,
+    );
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 4, 1, 0, 2, 3 }) }),
+        .members_invalid,
+    );
+    try t.check(
+        stdx.update(r, .{ .epoch = 0, .members = Test.to_members(.{ 4, 1, 0, 2, 3 }) }),
+        .members_invalid,
+    );
+    try t.check(
+        stdx.update(r, .{ .epoch = 1, .members = Test.to_members(.{ 4, 1, 0, 2, 3 }) }),
+        .members_invalid,
+    );
+    try t.check(stdx.update(r, .{ .replica_count = 4 }), .members_count_invalid);
+    try t.check(stdx.update(r, .{ .reserved = [_]u8{1} ** 54 }), .reserved_field);
+    try t.check(stdx.update(r, .{ .result = .ok }), .result_must_be_reserved);
+    try t.check(stdx.update(r, .{ .epoch = 0 }), .epoch_in_the_past);
+    try t.check(stdx.update(r, .{ .epoch = 3 }), .epoch_in_the_future);
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 1, 2, 3 }), .replica_count = 2 }),
+        .different_replica_count,
+    );
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 1, 2, 3, 4, 5 }), .standby_count = 2 }),
+        .different_standby_count,
+    );
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 8, 1, 2, 3 }) }),
+        .different_member_set,
+    );
+    try t.check(
+        stdx.update(r, .{ .epoch = 1, .members = Test.to_members(.{ 1, 2, 3, 4 }) }),
+        .configuration_applied,
+    );
+    try t.check(stdx.update(r, .{ .epoch = 1 }), .configuration_conflict);
+    try t.check(
+        stdx.update(r, .{ .members = Test.to_members(.{ 1, 2, 3, 4 }) }),
+        .configuration_is_no_op,
+    );
+
+    assert(t.tested.count() < ResultSet.initFull().count());
+    t.tested.insert(.reserved);
+    assert(t.tested.count() == ResultSet.initFull().count());
+
+    t.epoch = std.math.maxInt(u32);
+    try t.check(r, .epoch_in_the_past);
+    try t.check(stdx.update(r, .{ .epoch = std.math.maxInt(u32) }), .configuration_conflict);
+    try t.check(
+        stdx.update(r, .{
+            .epoch = std.math.maxInt(u32),
+            .members = Test.to_members(.{ 1, 2, 3, 4 }),
+        }),
+        .configuration_applied,
+    );
+}
 
 pub const Timeout = struct {
     name: []const u8,
@@ -936,23 +663,23 @@ pub fn exponential_backoff_with_jitter(
 
     // Do not use `@truncate(u6, attempt)` since that only discards the high bits:
     // We want a saturating exponent here instead.
-    const exponent = @intCast(u6, std.math.min(std.math.maxInt(u6), attempt));
+    const exponent = @as(u6, @intCast(@min(std.math.maxInt(u6), attempt)));
 
     // A "1" shifted left gives any power of two:
     // 1<<0 = 1, 1<<1 = 2, 1<<2 = 4, 1<<3 = 8
     const power = std.math.shlExact(u128, 1, exponent) catch unreachable; // Do not truncate.
 
-    // Ensure that `backoff` is calculated correctly when min is 0, taking `std.math.max(1, min)`.
+    // Ensure that `backoff` is calculated correctly when min is 0, taking `@max(1, min)`.
     // Otherwise, the final result will always be 0. This was an actual bug we encountered.
-    const min_non_zero = std.math.max(1, min);
+    const min_non_zero = @max(1, min);
     assert(min_non_zero > 0);
     assert(power > 0);
 
     // Calculate the capped exponential backoff component, `min(range, min * 2 ^ attempt)`:
-    const backoff = std.math.min(range, min_non_zero * power);
+    const backoff = @min(range, min_non_zero * power);
     const jitter = random.uintAtMostBiased(u64, backoff);
 
-    const result = @intCast(u64, min + jitter);
+    const result = @as(u64, @intCast(min + jitter));
     assert(result >= min);
     assert(result <= max);
 
@@ -994,45 +721,49 @@ pub fn parse_addresses(allocator: std.mem.Allocator, raw: []const u8, address_li
     while (comma_iterator.next()) |raw_address| : (index += 1) {
         assert(index < address_limit);
         if (raw_address.len == 0) return error.AddressHasTrailingComma;
-        addresses[index] = try parse_address(raw_address);
+        addresses[index] = try parse_address_and_port(raw_address);
     }
     assert(index == address_count);
 
     return addresses;
 }
 
-pub fn parse_address(raw: []const u8) !std.net.Address {
-    var colon_iterator = std.mem.split(u8, raw, ":");
-    // The split iterator will always return non-null once, even if the delimiter is not found:
-    const raw_ipv4 = colon_iterator.next().?;
+pub fn parse_address_and_port(string: []const u8) !std.net.Address {
+    assert(string.len > 0);
 
-    if (colon_iterator.next()) |raw_port| {
-        if (colon_iterator.next() != null) return error.AddressHasMoreThanOneColon;
+    if (std.mem.lastIndexOfAny(u8, string, ":.]")) |split| {
+        if (string[split] == ':') {
+            return parse_address(
+                string[0..split],
+                std.fmt.parseUnsigned(u16, string[split + 1 ..], 10) catch |err| switch (err) {
+                    error.Overflow => return error.PortOverflow,
+                    error.InvalidCharacter => return error.PortInvalid,
+                },
+            );
+        } else {
+            return parse_address(string, constants.port);
+        }
+    } else {
+        return std.net.Address.parseIp4(
+            constants.address,
+            std.fmt.parseUnsigned(u16, string, 10) catch |err| switch (err) {
+                error.Overflow => return error.PortOverflow,
+                error.InvalidCharacter => return error.AddressInvalid,
+            },
+        ) catch unreachable;
+    }
+}
 
-        const port = std.fmt.parseUnsigned(u16, raw_port, 10) catch |err| switch (err) {
-            error.Overflow => return error.PortOverflow,
-            error.InvalidCharacter => return error.PortInvalid,
-        };
-        return std.net.Address.parseIp4(raw_ipv4, port) catch {
+fn parse_address(string: []const u8, port: u16) !std.net.Address {
+    if (string.len == 0) return error.AddressInvalid;
+    if (string[string.len - 1] == ':') return error.AddressHasMoreThanOneColon;
+
+    if (string[0] == '[' and string[string.len - 1] == ']') {
+        return std.net.Address.parseIp6(string[1 .. string.len - 1], port) catch {
             return error.AddressInvalid;
         };
     } else {
-        // There was no colon in the address so there are now two cases:
-        // 1. an IPv4 address with the default port, or
-        // 2. a port with the default IPv4 address.
-
-        // Let's try parsing as a port first:
-        if (std.fmt.parseUnsigned(u16, raw, 10)) |port| {
-            return std.net.Address.parseIp4(constants.address, port) catch unreachable;
-        } else |err| switch (err) {
-            error.Overflow => return error.PortOverflow,
-            error.InvalidCharacter => {
-                // Something was not a digit, let's try parsing as an IPv4 instead:
-                return std.net.Address.parseIp4(raw, constants.port) catch {
-                    return error.AddressInvalid;
-                };
-            },
-        }
+        return std.net.Address.parseIp4(string, port) catch return error.AddressInvalid;
     }
 }
 
@@ -1076,6 +807,30 @@ test "parse_addresses" {
                 try std.net.Address.parseIp4(constants.address, 4321),
             },
         },
+        .{
+            // Test IPv6 address with default port.
+            .raw = "[fe80::1ff:fe23:4567:890a]",
+            .addresses = &[_]std.net.Address{
+                std.net.Address.initIp6(
+                    [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0xfe, 0x23, 0x45, 0x67, 0x89, 0x0a },
+                    constants.port,
+                    0,
+                    0,
+                ),
+            },
+        },
+        .{
+            // Test IPv6 address with port.
+            .raw = "[fe80::1ff:fe23:4567:890a]:1234",
+            .addresses = &[_]std.net.Address{
+                std.net.Address.initIp6(
+                    [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0xfe, 0x23, 0x45, 0x67, 0x89, 0x0a },
+                    1234,
+                    0,
+                    0,
+                ),
+            },
+        },
     };
 
     const vectors_negative = &[_]struct {
@@ -1083,6 +838,9 @@ test "parse_addresses" {
         err: anyerror![]std.net.Address,
     }{
         .{ .raw = "", .err = error.AddressHasTrailingComma },
+        .{ .raw = ".", .err = error.AddressInvalid },
+        .{ .raw = ":", .err = error.PortInvalid },
+        .{ .raw = ":92", .err = error.AddressInvalid },
         .{ .raw = "1.2.3.4:5,2.3.4.5:6,4.5.6.7:8", .err = error.AddressLimitExceeded },
         .{ .raw = "1.2.3.4:7777,", .err = error.AddressHasTrailingComma },
         .{ .raw = "1.2.3.4:7777,2.3.4.5::8888", .err = error.AddressHasMoreThanOneColon },
@@ -1100,7 +858,7 @@ test "parse_addresses" {
         defer std.testing.allocator.free(addresses_actual);
 
         try std.testing.expectEqual(addresses_actual.len, vector.addresses.len);
-        for (vector.addresses) |address_expect, i| {
+        for (vector.addresses, 0..) |address_expect, i| {
             const address_actual = addresses_actual[i];
             try std.testing.expectEqual(address_expect.in.sa.family, address_actual.in.sa.family);
             try std.testing.expectEqual(address_expect.in.sa.port, address_actual.in.sa.port);
@@ -1111,6 +869,29 @@ test "parse_addresses" {
 
     for (vectors_negative) |vector| {
         try std.testing.expectEqual(vector.err, parse_addresses(std.testing.allocator, vector.raw, 2));
+    }
+}
+
+test "parse_addresses: fuzz" {
+    const test_count = 1024;
+    const len_max = 32;
+    const alphabet = " \t\n,:[]0123456789abcdefgABCDEFGXx";
+
+    const seed = std.crypto.random.int(u64);
+
+    var prng = std.rand.DefaultPrng.init(seed);
+    const random = prng.random();
+
+    var input_max: [len_max]u8 = .{0} ** len_max;
+    for (0..test_count) |_| {
+        const len = random.uintAtMost(usize, len_max);
+        var input = input_max[0..len];
+        for (input) |*c| {
+            c.* = alphabet[random.uintAtMost(usize, alphabet.len)];
+        }
+        if (parse_addresses(std.testing.allocator, input, 3)) |addresses| {
+            std.testing.allocator.free(addresses);
+        } else |_| {}
     }
 }
 
@@ -1128,13 +909,14 @@ pub fn quorums(replica_count: u8) struct {
     replication: u8,
     view_change: u8,
     nack_prepare: u8,
+    majority: u8,
 } {
     assert(replica_count > 0);
 
     assert(constants.quorum_replication_max >= 2);
     // For replica_count=2, set quorum_replication=2 even though =1 would intersect.
     // This improves durability of small clusters.
-    const quorum_replication = if (replica_count == 2) 2 else std.math.min(
+    const quorum_replication = if (replica_count == 2) 2 else @min(
         constants.quorum_replication_max,
         stdx.div_ceil(replica_count, 2),
     );
@@ -1159,10 +941,15 @@ pub fn quorums(replica_count: u8) struct {
     const quorum_nack_prepare = replica_count - quorum_replication + 1;
     assert(quorum_nack_prepare + quorum_replication > replica_count);
 
+    const quorum_majority =
+        stdx.div_ceil(replica_count, 2) + @intFromBool(@mod(replica_count, 2) == 0);
+    assert(quorum_majority > @divFloor(replica_count, 2));
+
     return .{
         .replication = quorum_replication,
         .view_change = quorum_view_change,
         .nack_prepare = quorum_nack_prepare,
+        .majority = quorum_majority,
     };
 }
 
@@ -1172,13 +959,15 @@ test "quorums" {
     const expect_replication = [_]u8{ 1, 2, 2, 2, 3, 3, 3, 3 };
     const expect_view_change = [_]u8{ 1, 2, 2, 3, 3, 4, 5, 6 };
     const expect_nack_prepare = [_]u8{ 1, 1, 2, 3, 3, 4, 5, 6 };
+    const expect_majority = [_]u8{ 1, 2, 2, 3, 3, 4, 4, 5 };
 
-    for (expect_replication[0..]) |_, i| {
-        const replicas = @intCast(u8, i) + 1;
+    for (expect_replication[0..], 0..) |_, i| {
+        const replicas = @as(u8, @intCast(i)) + 1;
         const actual = quorums(replicas);
         try std.testing.expectEqual(actual.replication, expect_replication[i]);
         try std.testing.expectEqual(actual.view_change, expect_view_change[i]);
         try std.testing.expectEqual(actual.nack_prepare, expect_nack_prepare[i]);
+        try std.testing.expectEqual(actual.majority, expect_majority[i]);
 
         // The nack quorum only differs from the view-change quorum when R=2.
         if (replicas == 2) {
@@ -1189,51 +978,72 @@ test "quorums" {
     }
 }
 
+/// Set of replica_ids of cluster members, where order of ids determines replica indexes.
+///
+/// First replica_count elements are active replicas,
+/// then standby_count standbys, the rest are zeros.
+/// Order determines ring topology for replication.
+pub const Members = [constants.members_max]u128;
+
 /// Deterministically assigns replica_ids for the initial configuration.
 ///
-/// Eventualy, we want to identify replicas using random u128 ids to prevent operator errors.
+/// Eventually, we want to identify replicas using random u128 ids to prevent operator errors.
 /// However, that requires unergonomic two-step process for spinning a new cluster up.  To avoid
-/// needlessly compromizing the experience until reconfiguration is fully implemented, derive
+/// needlessly compromising the experience until reconfiguration is fully implemented, derive
 /// replica ids for the initial cluster deterministically.
-pub fn root_members(cluster: u32) [constants.nodes_max]u128 {
-    const IdSeed = packed struct {
-        cluster_config_checksum: u128 = config.configs.current.cluster.checksum(),
-        cluster: u32,
-        replica: u8,
+pub fn root_members(cluster: u128) Members {
+    const IdSeed = extern struct {
+        cluster_config_checksum: u128 align(1),
+        cluster: u128 align(1),
+        replica: u8 align(1),
     };
+    comptime assert(@sizeOf(IdSeed) == 33);
 
-    var result = [_]u128{0} ** constants.nodes_max;
+    var result = [_]u128{0} ** constants.members_max;
     var replica: u8 = 0;
-    while (replica < constants.nodes_max) : (replica += 1) {
-        result[replica] = checksum(std.mem.asBytes(&IdSeed{ .cluster = cluster, .replica = replica }));
+    while (replica < constants.members_max) : (replica += 1) {
+        const seed = IdSeed{
+            .cluster_config_checksum = constants.config.cluster.checksum(),
+            .cluster = cluster,
+            .replica = replica,
+        };
+        result[replica] = checksum(std.mem.asBytes(&seed));
     }
 
-    assert_valid_members(&result);
+    assert(valid_members(&result));
     return result;
 }
 
 /// Check that:
 ///  - all non-zero elements are different
 ///  - all zero elements are trailing
-pub fn assert_valid_members(members: *const [constants.nodes_max]u128) void {
-    for (members) |replica_i, i| {
+pub fn valid_members(members: *const Members) bool {
+    for (members, 0..) |replica_i, i| {
         for (members[0..i]) |replica_j| {
-            if (replica_j == 0) assert(replica_i == 0);
-            if (replica_j != 0) assert(replica_j != replica_i);
+            if (replica_j == 0 and replica_i != 0) return false;
+            if (replica_j != 0 and replica_j == replica_i) return false;
         }
     }
+    return true;
 }
 
-pub fn assert_valid_member(members: *const [constants.nodes_max]u128, replica_id: u128) void {
+fn member_count(members: *const Members) u8 {
+    for (members, 0..) |member, index| {
+        if (member == 0) return @as(u8, @intCast(index));
+    }
+    return constants.members_max;
+}
+
+pub fn member_index(members: *const Members, replica_id: u128) ?u8 {
     assert(replica_id != 0);
-    assert_valid_members(members);
-    for (members) |member| {
-        if (member == replica_id) break;
-    } else unreachable;
+    assert(valid_members(members));
+    for (members, 0..) |member, replica_index| {
+        if (member == replica_id) return @intCast(replica_index);
+    } else return null;
 }
 
 pub const Headers = struct {
-    pub const Array = std.BoundedArray(Header, constants.view_change_headers_max);
+    pub const Array = stdx.BoundedArray(Header.Prepare, constants.view_change_headers_max);
     /// The SuperBlock's persisted VSR headers.
     /// One of the following:
     ///
@@ -1242,19 +1052,30 @@ pub const Headers = struct {
     pub const ViewChangeSlice = ViewChangeHeadersSlice;
     pub const ViewChangeArray = ViewChangeHeadersArray;
 
-    fn dvc_blank(op: u64) Header {
-        return std.mem.zeroInit(Header, .{
-            .command = .reserved,
+    fn dvc_blank(op: u64) Header.Prepare {
+        return .{
+            .command = .prepare,
+            .operation = .reserved,
             .op = op,
-            .checksum = 0,
-        });
+            .cluster = 0,
+            .view = 0,
+            .request_checksum = 0,
+            .checkpoint_id = 0,
+            .parent = 0,
+            .client = 0,
+            .commit = 0,
+            .timestamp = 0,
+            .request = 0,
+        };
     }
 
-    pub fn dvc_header_type(header: *const Header) enum { blank, valid } {
+    pub fn dvc_header_type(header: *const Header.Prepare) enum { blank, valid } {
         if (std.meta.eql(header.*, Headers.dvc_blank(header.op))) return .blank;
 
-        assert(header.command == .prepare);
         if (constants.verify) assert(header.valid_checksum());
+        assert(header.command == .prepare);
+        assert(header.operation != .reserved);
+        assert(header.invalid() == null);
         return .valid;
     }
 };
@@ -1264,9 +1085,12 @@ pub const ViewChangeCommand = enum { do_view_change, start_view };
 const ViewChangeHeadersSlice = struct {
     command: ViewChangeCommand,
     /// Headers are ordered from high-to-low op.
-    slice: []const Header,
+    slice: []const Header.Prepare,
 
-    pub fn init(command: ViewChangeCommand, slice: []const Header) ViewChangeHeadersSlice {
+    pub fn init(
+        command: ViewChangeCommand,
+        slice: []const Header.Prepare,
+    ) ViewChangeHeadersSlice {
         const headers = ViewChangeHeadersSlice{
             .command = command,
             .slice = slice,
@@ -1285,16 +1109,17 @@ const ViewChangeHeadersSlice = struct {
         assert(Headers.dvc_header_type(head) == .valid);
 
         if (headers.command == .start_view) {
-            assert(headers.slice.len >= @minimum(
+            assert(headers.slice.len >= @min(
                 constants.view_change_headers_suffix_max,
                 head.op + 1, // +1 to include the head itself.
             ));
         }
 
         var child = head;
-        for (headers.slice[1..]) |*header, i| {
+        for (headers.slice[1..], 0..) |*header, i| {
             const index = i + 1;
-            assert(header.command == .prepare or header.command == .reserved);
+            assert(header.command == .prepare);
+            maybe(header.operation == .reserved);
             assert(header.op < child.op);
 
             // DVC: Ops are consecutive (with explicit blank headers).
@@ -1344,7 +1169,7 @@ const ViewChangeHeadersSlice = struct {
         const header_newest = &headers.slice[0];
         const header_oldest = blk: {
             var oldest: ?usize = null;
-            for (headers.slice) |*header, i| {
+            for (headers.slice, 0..) |*header, i| {
                 switch (Headers.dvc_header_type(header)) {
                     .blank => assert(i > 0),
                     .valid => oldest = i,
@@ -1381,19 +1206,25 @@ const ViewChangeHeadersSlice = struct {
 };
 
 test "Headers.ViewChangeSlice.view_for_op" {
-    var headers_array = [_]Header{
-        std.mem.zeroInit(Header, .{
+    var headers_array = [_]Header.Prepare{
+        std.mem.zeroInit(Header.Prepare, .{
             .checksum = undefined,
+            .client = 6,
+            .request = 7,
             .command = .prepare,
+            .operation = @as(Operation, @enumFromInt(constants.vsr_operations_reserved + 8)),
             .op = 9,
             .view = 10,
             .timestamp = 11,
         }),
         Headers.dvc_blank(8),
         Headers.dvc_blank(7),
-        std.mem.zeroInit(Header, .{
+        std.mem.zeroInit(Header.Prepare, .{
             .checksum = undefined,
+            .client = 3,
+            .request = 4,
             .command = .prepare,
+            .operation = @as(Operation, @enumFromInt(constants.vsr_operations_reserved + 5)),
             .op = 6,
             .view = 7,
             .timestamp = 8,
@@ -1420,19 +1251,19 @@ const ViewChangeHeadersArray = struct {
     command: ViewChangeCommand,
     array: Headers.Array,
 
-    pub fn root(cluster: u32) ViewChangeHeadersArray {
+    pub fn root(cluster: u128) ViewChangeHeadersArray {
         return ViewChangeHeadersArray.init_from_slice(.start_view, &.{
-            Header.root_prepare(cluster),
+            Header.Prepare.root(cluster),
         });
     }
 
     pub fn init_from_slice(
         command: ViewChangeCommand,
-        slice: []const Header,
+        slice: []const Header.Prepare,
     ) ViewChangeHeadersArray {
         const headers = ViewChangeHeadersArray{
             .command = command,
-            .array = Headers.Array.fromSlice(slice) catch unreachable,
+            .array = Headers.Array.from_slice(slice) catch unreachable,
         };
         headers.verify();
         return headers;
@@ -1450,7 +1281,7 @@ const ViewChangeHeadersArray = struct {
     pub fn verify(headers: *const ViewChangeHeadersArray) void {
         (ViewChangeHeadersSlice{
             .command = headers.command,
-            .slice = headers.array.constSlice(),
+            .slice = headers.array.const_slice(),
         }).verify();
     }
 
@@ -1458,16 +1289,18 @@ const ViewChangeHeadersArray = struct {
         assert(headers.command == .start_view);
         // This function is only called by a replica that is lagging behind the primary's
         // checkpoint, so the start_view has a full suffix of headers.
-        assert(headers.array.get(0).op >= constants.journal_slot_count);
-        assert(headers.array.len >= constants.view_change_headers_suffix_max);
-        assert(headers.array.len >= constants.pipeline_prepare_queue_max + 1);
+        assert(headers.array.get(0).op >=
+            constants.vsr_checkpoint_interval + constants.lsm_batch_multiple);
+        assert(headers.array.count() >= constants.view_change_headers_suffix_max);
+        assert(headers.array.count() >= constants.pipeline_prepare_queue_max + 1);
 
-        const commit_max = std.math.max(
+        const commit_max = @max(
             headers.array.get(0).op -| constants.pipeline_prepare_queue_max,
             headers.array.get(0).commit,
         );
         const commit_max_header = headers.array.get(headers.array.get(0).op - commit_max);
         assert(commit_max_header.command == .prepare);
+        assert(commit_max_header.operation != .reserved);
         assert(commit_max_header.op == commit_max);
 
         // SVs may include more headers than DVC:
@@ -1476,7 +1309,7 @@ const ViewChangeHeadersArray = struct {
         //   (SV headers are determined by view_change_headers_suffix_max,
         //   but DVC headers must stop at commit_max.)
         headers.command = .do_view_change;
-        headers.array.len = constants.pipeline_prepare_queue_max + 1;
+        headers.array.truncate(constants.pipeline_prepare_queue_max + 1);
 
         headers.verify();
     }
@@ -1484,23 +1317,102 @@ const ViewChangeHeadersArray = struct {
     pub fn replace(
         headers: *ViewChangeHeadersArray,
         command: ViewChangeCommand,
-        slice: []const Header,
+        slice: []const Header.Prepare,
     ) void {
         headers.command = command;
-        headers.array.len = 0;
-        for (slice) |*header| headers.array.appendAssumeCapacity(header.*);
+        headers.array.clear();
+        for (slice) |*header| headers.array.append_assume_capacity(header.*);
         headers.verify();
     }
 
-    pub fn append(headers: *ViewChangeHeadersArray, header: *const Header) void {
+    pub fn append(headers: *ViewChangeHeadersArray, header: *const Header.Prepare) void {
         // We don't do comprehensive validation here — assume that verify() will be called
         // after any series of appends.
-        headers.array.appendAssumeCapacity(header.*);
+        headers.array.append_assume_capacity(header.*);
     }
 
     pub fn append_blank(headers: *ViewChangeHeadersArray, op: u64) void {
         assert(headers.command == .do_view_change);
-        assert(headers.array.len > 0);
-        headers.array.appendAssumeCapacity(Headers.dvc_blank(op));
+        assert(headers.array.count() > 0);
+        headers.array.append_assume_capacity(Headers.dvc_blank(op));
+    }
+};
+
+/// For a replica with journal_slot_count=9, lsm_batch_multiple=2, pipeline_prepare_queue_max=1, and
+/// checkpoint_interval = journal_slot_count - (lsm_batch_multiple + pipeline_prepare_queue_max) = 6
+///
+///   checkpoint() call           0   1   2   3
+///   op_checkpoint               0   5  11  17
+///   op_checkpoint_next          5  11  17  23
+///   op_checkpoint_next_trigger  7  13  19  25
+///
+///     commit log (ops)           │ write-ahead log (slots)
+///     0   4   8   2   6   0   4  │  0  -  -  -  4  -  -  -  8
+///   0 ─────✓·%                   │[ 0  1  2  3  4  ✓] 6  %  R
+///   1 ───────────✓·%             │  9 10  ✓]12  %  5[ 6  7  8
+///   2 ─────────────────✓·%       │ 18  % 11[12 13 14 15 16  ✓]
+///   3 ───────────────────────✓·% │[18 19 20 21 22  ✓]24  % 17
+///
+/// Legend:
+///
+///   ─/✓  op on disk at checkpoint
+///   ·/%  op in memory at checkpoint
+///     ✓  op_checkpoint
+///     %  op_checkpoint's trigger
+///     R  slot reserved in WAL
+///    [ ] range of ops from a checkpoint
+pub const Checkpoint = struct {
+    comptime {
+        assert(constants.journal_slot_count > constants.lsm_batch_multiple);
+        assert(constants.journal_slot_count % constants.lsm_batch_multiple == 0);
+    }
+
+    pub fn checkpoint_after(checkpoint: u64) u64 {
+        assert(valid(checkpoint));
+
+        const result = op: {
+            if (checkpoint == 0) {
+                // First wrap: op_checkpoint_next = 6-1 = 5
+                // -1: vsr_checkpoint_interval is a count, result is an inclusive index.
+                break :op constants.vsr_checkpoint_interval - 1;
+            } else {
+                // Second wrap: op_checkpoint_next = 5+6 = 11
+                // Third wrap: op_checkpoint_next = 11+6 = 17
+                break :op checkpoint + constants.vsr_checkpoint_interval;
+            }
+        };
+
+        assert((result + 1) % constants.lsm_batch_multiple == 0);
+        assert(valid(result));
+
+        return result;
+    }
+
+    pub fn trigger_for_checkpoint(checkpoint: u64) ?u64 {
+        assert(valid(checkpoint));
+
+        if (checkpoint == 0) {
+            return null;
+        } else {
+            return checkpoint + constants.lsm_batch_multiple;
+        }
+    }
+
+    pub fn valid(op: u64) bool {
+        // Divide by `lsm_batch_multiple` instead of `vsr_checkpoint_interval`:
+        // although today in practice checkpoints are evenly spaced, the LSM layer doesn't assume
+        // that. LSM allows any bar boundary to become a checkpoint which happens, e.g., in the tree
+        // fuzzer.
+        return op == 0 or (op + 1) % constants.lsm_batch_multiple == 0;
+    }
+};
+
+pub const Snapshot = struct {
+    /// A table with TableInfo.snapshot_min=S was written during some commit with op<S.
+    /// A block with snapshot_min=S is definitely readable at op=S.
+    pub fn readable_at_commit(op: u64) u64 {
+        // TODO: This is going to become more complicated when snapshot numbers match the op
+        // acquiring the snapshot.
+        return op + 1;
     }
 };

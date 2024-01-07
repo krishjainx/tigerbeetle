@@ -54,7 +54,7 @@ pub const Network = struct {
     ///
     /// At the moment, we require core members to have direct bidirectional connectivity, but this
     /// could be relaxed in the future to indirect connectivity.
-    pub const Core = std.StaticBitSet(constants.nodes_max);
+    pub const Core = std.StaticBitSet(constants.members_max);
 
     allocator: std.mem.Allocator,
 
@@ -148,8 +148,8 @@ pub const Network = struct {
             while (it_target.next()) |replica_target| {
                 if (replica_target != replica_source) {
                     network.link_filter(.{
-                        .source = .{ .replica = @intCast(u8, replica_source) },
-                        .target = .{ .replica = @intCast(u8, replica_target) },
+                        .source = .{ .replica = @as(u8, @intCast(replica_source)) },
+                        .target = .{ .replica = @as(u8, @intCast(replica_target)) },
                     }).* = LinkFilter.initFull();
                 }
             }
@@ -160,12 +160,12 @@ pub const Network = struct {
         const raw_process = switch (process) {
             .replica => |replica| replica,
             .client => |client| blk: {
-                assert(client >= constants.nodes_max);
+                assert(client >= constants.members_max);
                 break :blk client;
             },
         };
 
-        for (network.processes.items) |existing_process, i| {
+        for (network.processes.items, 0..) |existing_process, i| {
             if (existing_process == raw_process) {
                 network.buses.items[i] = message_bus;
                 break;
@@ -218,7 +218,7 @@ pub const Network = struct {
             message.header.command,
         });
 
-        const network_message = network.message_pool.get_message();
+        const network_message = network.message_pool.get_message(null);
         defer network.message_pool.unref(network_message);
 
         stdx.copy_disjoint(.exact, u8, network_message.buffer, message.buffer);
@@ -237,13 +237,13 @@ pub const Network = struct {
     }
 
     fn process_to_address(network: *const Network, process: Process) u8 {
-        for (network.processes.items) |p, i| {
+        for (network.processes.items, 0..) |p, i| {
             if (std.meta.eql(raw_process_to_process(p), process)) {
                 switch (process) {
                     .replica => assert(i < network.options.node_count),
                     .client => assert(i >= network.options.node_count),
                 }
-                return @intCast(u8, i);
+                return @as(u8, @intCast(i));
             }
         }
         log.err("no such process: {} (have {any})", .{ process, network.processes.items });
@@ -271,7 +271,7 @@ pub const Network = struct {
         }
 
         const target_bus = network.buses.items[path.target];
-        const target_message = target_bus.get_message();
+        const target_message = target_bus.get_message(null);
         defer target_bus.unref(target_message);
 
         stdx.copy_disjoint(.exact, u8, target_message.buffer, packet.message.buffer);
@@ -289,7 +289,7 @@ pub const Network = struct {
             if (target_message.header.size != sector_ceil) {
                 assert(target_message.header.size < sector_ceil);
                 assert(target_message.buffer.len == constants.message_size_max);
-                mem.set(u8, target_message.buffer[target_message.header.size..sector_ceil], 0);
+                @memset(target_message.buffer[target_message.header.size..sector_ceil], 0);
             }
         }
 
@@ -298,9 +298,9 @@ pub const Network = struct {
 
     fn raw_process_to_process(raw: u128) Process {
         switch (raw) {
-            0...(constants.nodes_max - 1) => return .{ .replica = @intCast(u8, raw) },
+            0...(constants.members_max - 1) => return .{ .replica = @as(u8, @intCast(raw)) },
             else => {
-                assert(raw >= constants.nodes_max);
+                assert(raw >= constants.members_max);
                 return .{ .client = raw };
             },
         }

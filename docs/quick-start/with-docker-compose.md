@@ -1,15 +1,15 @@
 ---
-sidebar_position: 3
+sidebar_position: 4
 ---
 
-# 3-node cluster with Docker Compose
+# Three-node cluster with Docker Compose
 
 First, provision the data file for each node:
 
-```
-$ docker run -v $(pwd)/data:/data ghcr.io/tigerbeetledb/tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/0_0.tigerbeetle
-$ docker run -v $(pwd)/data:/data ghcr.io/tigerbeetledb/tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/0_1.tigerbeetle
-$ docker run -v $(pwd)/data:/data ghcr.io/tigerbeetledb/tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/0_2.tigerbeetle
+```console
+docker run -v $(pwd)/data:/data ghcr.io/tigerbeetle/tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/0_0.tigerbeetle
+docker run -v $(pwd)/data:/data ghcr.io/tigerbeetle/tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/0_1.tigerbeetle
+docker run -v $(pwd)/data:/data ghcr.io/tigerbeetle/tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/0_2.tigerbeetle
 ```
 
 Then create a docker-compose.yml file:
@@ -33,21 +33,21 @@ version: "3.7"
 
 services:
   tigerbeetle_0:
-    image: ghcr.io/tigerbeetledb/tigerbeetle
+    image: ghcr.io/tigerbeetle/tigerbeetle
     command: "start --addresses=0.0.0.0:3001,0.0.0.0:3002,0.0.0.0:3003 /data/0_0.tigerbeetle"
     network_mode: host
     volumes:
       - ./data:/data
 
   tigerbeetle_1:
-    image: ghcr.io/tigerbeetledb/tigerbeetle
+    image: ghcr.io/tigerbeetle/tigerbeetle
     command: "start --addresses=0.0.0.0:3001,0.0.0.0:3002,0.0.0.0:3003 /data/0_1.tigerbeetle"
     network_mode: host
     volumes:
       - ./data:/data
 
   tigerbeetle_2:
-    image: ghcr.io/tigerbeetledb/tigerbeetle
+    image: ghcr.io/tigerbeetle/tigerbeetle
     command: "start --addresses=0.0.0.0:3001,0.0.0.0:3002,0.0.0.0:3003 /data/0_2.tigerbeetle"
     network_mode: host
     volumes:
@@ -56,8 +56,10 @@ services:
 
 And run it:
 
+```console
+docker-compose up
 ```
-$ docker-compose up
+```console
 docker-compose up
 Starting tigerbeetle_0   ... done
 Starting tigerbeetle_2   ... done
@@ -82,10 +84,11 @@ tigerbeetle_1    | info(clock): 1: system time is 78ns ahead
 ... and so on ...
 ```
 
+### Connect with the CLI
 
 Now you can connect to the running server with any client. For a quick
-start, try [creating accounts and transfers in the Node
-CLI](./node-cli.md).
+start, try creating accounts and transfers [using the TigerBeetle CLI
+client](./cli-client.md).
 
 ## `error: SystemResources` on macOS
 
@@ -97,7 +100,7 @@ on macOS, you will need to add the `IPC_LOCK` capability.
 
 services:
   tigerbeetle_0:
-    image: ghcr.io/tigerbeetledb/tigerbeetle
+    image: ghcr.io/tigerbeetle/tigerbeetle
     command: "start --addresses=0.0.0.0:3001,0.0.0.0:3002,0.0.0.0:3003 /data/0_0.tigerbeetle"
     network_mode: host
     cap_add:       # HERE
@@ -108,7 +111,18 @@ services:
 ... rest of docker-compose.yml ...
 ```
 
-See https://github.com/tigerbeetledb/tigerbeetle/issues/92 for discussion.
+See https://github.com/tigerbeetle/tigerbeetle/issues/92 for discussion.
+
+## `exited with code 137`
+
+If you see this error without any logs from TigerBeetle, it is likely
+that the Linux OOMKiller is killing the process. If you are running
+Docker inside a virtual machine (such as is required on Docker or
+Podman for macOS), try increasing the virtual machine memory limit.
+
+Alternatively, in a development environment, you can lower the size of
+the cache so TigerBeetle uses less memory. For example, set
+`--cache-grid=512MB` when running `tigerbeetle start`.
 
 ## Debugging panics
 
@@ -117,5 +131,5 @@ better stack trace by switching to a debug image (by using the `:debug`
 Docker image tag).
 
 ```bash
-ghcr.io/tigerbeetledb/tigerbeetle:debug
+ghcr.io/tigerbeetle/tigerbeetle:debug
 ```

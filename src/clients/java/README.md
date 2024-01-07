@@ -71,13 +71,13 @@ Then create `pom.xml` and copy this into it:
       <version>0.0.1-3431</version>
     </dependency>
   </dependencies>
-</project> 
+</project>
 ```
 
 Then, install the TigerBeetle client:
 
 ```console
-$ mvn install
+mvn install
 ```
 
 Now, create `src/main/java/Main.java` and copy this into it:
@@ -97,7 +97,7 @@ public final class Main {
 Finally, build and run:
 
 ```console
-$ mvn exec:java
+mvn exec:java
 ```
 
 Now that all prerequisites and dependencies are correctly set
@@ -112,6 +112,8 @@ features of TigerBeetle.
 * [Basic](/src/clients/java/samples/basic/): Create two accounts and transfer an amount between them.
 * [Two-Phase Transfer](/src/clients/java/samples/two-phase/): Create two accounts and start a pending transfer between
 them, then post the transfer.
+* [Many Two-Phase Transfers](/src/clients/java/samples/two-phase-many/): Create two accounts and start a number of pending transfer
+between them, posting and voiding alternating transfers.
 ## Creating a Client
 
 A client is created with a cluster ID and replica
@@ -119,9 +121,8 @@ addresses for all replicas in the cluster. The cluster
 ID and replica addresses are both chosen by the system that
 starts the TigerBeetle cluster.
 
-Clients are thread-safe. But for better
-performance, a single instance should be shared between
-multiple concurrent tasks.
+Clients are thread-safe and a single instance should be shared
+between multiple concurrent tasks.
 
 Multiple clients are useful when connecting to more than
 one TigerBeetle cluster.
@@ -131,10 +132,12 @@ replica. The address is read from the `TB_ADDRESS`
 environment variable and defaults to port `3000`.
 
 ```java
-var tbAddress = System.getenv("TB_ADDRESS");
+var replicaAddress = System.getenv("TB_ADDRESS");
+byte[] clusterID = UInt128.asBytes(0);
+String[] replicaAddresses = new String[] {replicaAddress == null ? "3000" : replicaAddress};
 Client client = new Client(
-  0,
-  new String[] {tbAddress.length() > 0 ? tbAddress : "3000"}
+  clusterID,
+  replicaAddresses
 );
 ```
 
@@ -146,8 +149,6 @@ syntax:
 ```java
 try (var client = new Client(...)) {
   // Use client
-} catch (Exception e) {
-  // Handle exception
 }
 ```
 
@@ -165,7 +166,9 @@ reference](https://docs.tigerbeetle.com/reference/accounts).
 AccountBatch accounts = new AccountBatch(1);
 accounts.add();
 accounts.setId(137);
-accounts.setUserData(UInt128.asBytes(new java.math.BigInteger("92233720368547758070")));
+accounts.setUserData128(UInt128.asBytes(java.util.UUID.randomUUID()));
+accounts.setUserData64(1234567890);
+accounts.setUserData32(42);
 accounts.setLedger(1);
 accounts.setCode(718);
 accounts.setFlags(0);
@@ -173,14 +176,17 @@ accounts.setFlags(0);
 CreateAccountResultBatch accountErrors = client.createAccounts(accounts);
 ```
 
-The 128-bit fields like `id` and `user_data` have a few
+The 128-bit fields like `id` and `user_data_128` have a few
 overrides to make it easier to integrate. You can either
 pass in a long, a pair of longs (least and most
 significant bits), or a `byte[]`.
 
 There is also a `com.tigerbeetle.UInt128` helper with static
 methods for converting 128-bit little-endian unsigned integers
-between instances of `long`, `UUID`, `BigInteger` and `byte[]`.
+between instances of `long`, `java.util.UUID`, `java.math.BigInteger` and `byte[]`.
+
+The fields for transfer amounts and account balances are also 128-bit,
+but they are always represented as a `java.math.BigInteger`.
 
 ### Account Flags
 
@@ -245,7 +251,7 @@ while (accountErrors.next()) {
     switch (accountErrors.getResult()) {
         case Exists:
             System.err.printf("Account at %d already exists.\n",
-                accountErrors.getIndex());        
+                accountErrors.getIndex());
             break;
 
         default:
@@ -288,12 +294,14 @@ transfers.add();
 transfers.setId(1);
 transfers.setDebitAccountId(1);
 transfers.setCreditAccountId(2);
-transfers.setUserData(2);
+transfers.setAmount(10);
+transfers.setUserData128(UInt128.asBytes(java.util.UUID.randomUUID()));
+transfers.setUserData64(1234567890);
+transfers.setUserData32(42);
 transfers.setTimeout(0);
 transfers.setLedger(1);
 transfers.setCode(1);
 transfers.setFlags(0);
-transfers.setAmount(10);
 
 CreateTransferResultBatch transferErrors = client.createTransfers(transfers);
 ```
@@ -302,7 +310,7 @@ CreateTransferResultBatch transferErrors = client.createTransfers(transfers);
 
 The response is an empty array if all transfers were created
 successfully. If the response is non-empty, each object in the
-response array contains error information for an transfer that
+response array contains error information for a transfer that
 failed. The error object contains an error code and the index of the
 transfer in the request batch.
 
@@ -314,7 +322,7 @@ while (transferErrors.next()) {
     switch (transferErrors.getResult()) {
         case ExceedsCredits:
             System.err.printf("Transfer at %d exceeds credits.\n",
-                transferErrors.getIndex());        
+                transferErrors.getIndex());
             break;
 
         default:
@@ -334,12 +342,17 @@ you. So, for example, you *can* insert 1 million transfers
 one at a time like so:
 
 ```java
-for (int i = 0; i < transfers.length; i++) {
+var transferIds = new long[]{100, 101, 102};
+var debitIds = new long[]{1, 2, 3};
+var creditIds = new long[]{4, 5, 6};
+var amounts = new long[]{1000, 29, 11};
+for (int i = 0; i < transferIds.length; i++) {
   TransferBatch batch = new TransferBatch(1);
   batch.add();
-  batch.setId(transfers[i].getId());
-  batch.setDebitAccountId(transfers[i].getDebitAccountId());
-  batch.setCreditAccountId(transfers[i].getCreditAccountId());
+  batch.setId(transferIds[i]);
+  batch.setDebitAccountId(debitIds[i]);
+  batch.setCreditAccountId(creditIds[i]);
+  batch.setAmount(amounts[i]);
 
   CreateTransferResultBatch errors = client.createTransfers(batch);
   // error handling omitted
@@ -350,18 +363,19 @@ But the insert rate will be a *fraction* of
 potential. Instead, **always batch what you can**.
 
 The maximum batch size is set in the TigerBeetle server. The default
-is 8191.
+is 8190.
 
 ```java
-var BATCH_SIZE = 8191;
-for (int i = 0; i < transfers.length; i += BATCH_SIZE) {
+var BATCH_SIZE = 8190;
+for (int i = 0; i < transferIds.length; i += BATCH_SIZE) {
   TransferBatch batch = new TransferBatch(BATCH_SIZE);
 
-  for (int j = 0; j < BATCH_SIZE && i + j < transfers.length; j++) {
+  for (int j = 0; j < BATCH_SIZE && i + j < transferIds.length; j++) {
     batch.add();
-    batch.setId(transfers[i + j].getId());
-    batch.setDebitAccountId(transfers[i + j].getDebitAccountId());
-    batch.setCreditAccountId(transfers[i + j].getCreditAccountId());
+    batch.setId(transferIds[i+j]);
+    batch.setDebitAccountId(debitIds[i+j]);
+    batch.setCreditAccountId(creditIds[i+j]);
+    batch.setAmount(amounts[i+j]);
   }
 
   CreateTransferResultBatch errors = client.createTransfers(batch);
@@ -473,6 +487,28 @@ ids.add(2);
 transfers = client.lookupTransfers(ids);
 ```
 
+## Get Account Transfers
+
+NOTE: This is a preview API that is subject to breaking changes once we have
+a stable querying API.
+
+Fetches the transfers involving a given account, allowing basic filter and pagination
+capabilities.
+
+The transfers in the response are sorted by `timestamp` in chronological or
+reverse-chronological order.
+
+```java
+AccountTransfers filter = new AccountTransfers();
+filter.setAccountId(2);
+filter.setTimestamp(0); // No filter by Timestamp.
+filter.setLimit(10); // Limit to ten transfers at most.
+filter.setDebits(true); // Include transfer from the debit side.
+filter.setCredits(true); // Include transfer from the credit side.
+filter.setReversed(true); // Sort by timestamp in reverse-chronological order.
+transfers = client.getAccountTransfers(filter);
+```
+
 ## Linked Events
 
 When the `linked` flag is specified for an account when creating accounts or
@@ -545,13 +581,13 @@ transferErrors = client.createTransfers(transfers);
 In a POSIX shell run:
 
 ```console
-$ git clone https://github.com/tigerbeetledb/tigerbeetle
-$ cd tigerbeetle
-$ git submodule update --init --recursive
-$ ./scripts/install_zig.sh
-$ cd src/clients/java
-$ ./scripts/install.sh
-$ if [ "$TEST" = "true" ]; then mvn test; else echo "Skipping client unit tests"; fi
+git clone https://github.com/tigerbeetle/tigerbeetle
+cd tigerbeetle
+git submodule update --init --recursive
+./scripts/install_zig.sh
+cd src/clients/java
+./scripts/install.sh
+if [ "$TEST" = "true" ]; then mvn test; else echo "Skipping client unit tests"; fi
 ```
 
 ### On Windows
@@ -559,12 +595,11 @@ $ if [ "$TEST" = "true" ]; then mvn test; else echo "Skipping client unit tests"
 In PowerShell run:
 
 ```console
-$ git clone https://github.com/tigerbeetledb/tigerbeetle
-$ cd tigerbeetle
-$ git submodule update --init --recursive
-$ .\scripts\install_zig.bat
-$ cd src/clients/java
-$ .\scripts\install.bat
-$ if ($env:TEST -eq 'true') { mvn test } else { echo "Skipping client unit test" }
+git clone https://github.com/tigerbeetle/tigerbeetle
+cd tigerbeetle
+git submodule update --init --recursive
+.\scripts\install_zig.bat
+cd src/clients/java
+.\scripts\install.bat
+if ($env:TEST -eq 'true') { mvn test } else { echo "Skipping client unit test" }
 ```
-

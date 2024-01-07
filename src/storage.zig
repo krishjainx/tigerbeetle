@@ -2,8 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const os = std.os;
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 const log = std.log.scoped(.storage);
 
+const stdx = @import("stdx.zig");
 const IO = @import("io.zig").IO;
 const FIFO = @import("fifo.zig").FIFO;
 const constants = @import("constants.zig");
@@ -18,7 +20,7 @@ pub const Storage = struct {
 
     pub const Read = struct {
         completion: IO.Completion,
-        callback: fn (read: *Storage.Read) void,
+        callback: *const fn (read: *Storage.Read) void,
 
         /// The buffer to read into, re-sliced and re-assigned as we go, e.g. after partial reads.
         buffer: []u8,
@@ -57,21 +59,24 @@ pub const Storage = struct {
                 max -= partial_sector_read;
             }
 
-            return read.buffer[0..std.math.min(read.buffer.len, max)];
+            return read.buffer[0..@min(read.buffer.len, max)];
         }
     };
 
     pub const Write = struct {
         completion: IO.Completion,
-        callback: fn (write: *Storage.Write) void,
+        callback: *const fn (write: *Storage.Write) void,
         buffer: []const u8,
         offset: u64,
     };
 
     pub const NextTick = struct {
         next: ?*NextTick = null,
-        callback: fn (next_tick: *NextTick) void,
+        source: NextTickSource,
+        callback: *const fn (next_tick: *NextTick) void,
     };
+
+    pub const NextTickSource = enum { lsm, vsr };
 
     io: *IO,
     fd: os.fd_t,
@@ -102,10 +107,15 @@ pub const Storage = struct {
 
     pub fn on_next_tick(
         storage: *Storage,
-        callback: fn (next_tick: *Storage.NextTick) void,
+        source: NextTickSource,
+        callback: *const fn (next_tick: *Storage.NextTick) void,
         next_tick: *Storage.NextTick,
     ) void {
-        next_tick.* = .{ .callback = callback };
+        next_tick.* = .{
+            .source = source,
+            .callback = callback,
+        };
+
         storage.next_tick_queue.push(next_tick);
 
         if (!storage.next_tick_completion_scheduled) {
@@ -117,6 +127,15 @@ pub const Storage = struct {
                 &storage.next_tick_completion,
                 0, // 0ns timeout means to resolve as soon as possible - like a yield
             );
+        }
+    }
+
+    pub fn reset_next_tick_lsm(storage: *Storage) void {
+        var next_tick_iterator = storage.next_tick_queue;
+        storage.next_tick_queue.reset();
+
+        while (next_tick_iterator.pop()) |next_tick| {
+            if (next_tick.source != .lsm) storage.next_tick_queue.push(next_tick);
         }
     }
 
@@ -145,19 +164,16 @@ pub const Storage = struct {
 
     pub fn read_sectors(
         self: *Storage,
-        callback: fn (read: *Storage.Read) void,
+        callback: *const fn (read: *Storage.Read) void,
         read: *Storage.Read,
         buffer: []u8,
         zone: vsr.Zone,
         offset_in_zone: u64,
     ) void {
-        if (zone.size()) |zone_size| {
-            assert(offset_in_zone + buffer.len <= zone_size);
-        }
+        zone.verify_iop(buffer, offset_in_zone);
+        assert(zone != .grid_padding);
 
         const offset_in_storage = zone.offset(offset_in_zone);
-        assert_alignment(buffer, offset_in_storage);
-
         read.* = .{
             .completion = undefined,
             .callback = callback,
@@ -171,6 +187,8 @@ pub const Storage = struct {
     }
 
     fn start_read(self: *Storage, read: *Storage.Read, bytes_read: ?usize) void {
+        assert(read.offset % constants.sector_size == 0);
+
         const bytes = bytes_read orelse 0;
         assert(bytes <= read.target().len);
 
@@ -240,7 +258,7 @@ pub const Storage = struct {
                     // TODO This could be an interesting avenue to explore further, whether
                     // temporary or permanent EIO errors should be conflated with checksum failures.
                     assert(target.len > 0);
-                    std.mem.set(u8, target, 0);
+                    @memset(target, 0);
 
                     // We could set `read.target_max` to `vsr.sector_ceil(read.buffer.len)` here
                     // in order to restart our pseudo-binary search on the rest of the sectors to be
@@ -271,15 +289,18 @@ pub const Storage = struct {
             },
         };
 
+        // We tried to read more than there really is available to read.
+        // In other words, we thought we could read beyond the end of the file descriptor.
+        //
+        // Some possible causes:
+        // - The data file inode `size` was truncated or corrupted.
+        // - We are reading the last grid block in the data file, (block_size bytes), but the block
+        //   in question is smaller (e.g. only 1 sector).
+        // - Another replica requested a block, but we are lagging far behind, and the block address
+        //   requested is beyond the end of our data file.
         if (bytes_read == 0) {
-            // We tried to read more than there really is available to read.
-            // In other words, we thought we could read beyond the end of the file descriptor.
-            // This can happen if the data file inode `size` was truncated or corrupted.
-            log.err(
-                "short read: buffer.len={} offset={} bytes_read={}",
-                .{ read.offset, read.buffer.len, bytes_read },
-            );
-            @panic("data file inode size was truncated or corrupted");
+            read.callback(read);
+            return;
         }
 
         // If our target was limited to a single sector, perhaps because of a latent sector error,
@@ -296,19 +317,16 @@ pub const Storage = struct {
 
     pub fn write_sectors(
         self: *Storage,
-        callback: fn (write: *Storage.Write) void,
+        callback: *const fn (write: *Storage.Write) void,
         write: *Storage.Write,
         buffer: []const u8,
         zone: vsr.Zone,
         offset_in_zone: u64,
     ) void {
-        if (zone.size()) |zone_size| {
-            assert(offset_in_zone + buffer.len <= zone_size);
-        }
+        zone.verify_iop(buffer, offset_in_zone);
+        maybe(zone == .grid_padding); // Padding is zeroed during format.
 
         const offset_in_storage = zone.offset(offset_in_zone);
-        assert_alignment(buffer, offset_in_storage);
-
         write.* = .{
             .completion = undefined,
             .callback = callback,
@@ -322,7 +340,9 @@ pub const Storage = struct {
     }
 
     fn start_write(self: *Storage, write: *Storage.Write) void {
+        assert(write.offset % constants.sector_size == 0);
         self.assert_bounds(write.buffer, write.offset);
+
         self.io.write(
             *Storage,
             self,
@@ -371,16 +391,6 @@ pub const Storage = struct {
         }
 
         self.start_write(write);
-    }
-
-    /// Ensures that the read or write is aligned correctly for Direct I/O.
-    /// If this is not the case, then the underlying syscall will return EINVAL.
-    /// We check this only at the start of a read or write because the physical sector size may be
-    /// less than our logical sector size so that partial IOs then leave us no longer aligned.
-    fn assert_alignment(buffer: []const u8, offset: u64) void {
-        assert(@ptrToInt(buffer.ptr) % constants.sector_size == 0);
-        assert(buffer.len % constants.sector_size == 0);
-        assert(offset % constants.sector_size == 0);
     }
 
     /// Ensures that the read or write is within bounds and intends to read or write some bytes.

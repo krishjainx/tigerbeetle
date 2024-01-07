@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 
 const stdx = @import("../stdx.zig");
 const constants = @import("../constants.zig");
@@ -24,7 +25,7 @@ const InMemoryAOF = struct {
     pub fn readAll(self: *Self, buf: []u8) !usize {
         // Limit the reads to the end of the buffer and return the count of
         // bytes read, to have the same behavior as fs's readAll.
-        const end = @minimum(self.index + buf.len, self.backing_store.len);
+        const end = @min(self.index + buf.len, self.backing_store.len);
 
         stdx.copy_disjoint(.inexact, u8, buf, self.backing_store[self.index..end]);
         return end - self.index;
@@ -41,7 +42,7 @@ pub const AOF = struct {
     validation_checksums: std.AutoHashMap(u128, void) = undefined,
 
     pub fn init(allocator: std.mem.Allocator) !AOF {
-        const memory = try allocator.allocAdvanced(u8, constants.sector_size, backing_size, .exact);
+        const memory = try allocator.alignedAlloc(u8, constants.sector_size, backing_size);
         errdefer allocator.free(memory);
 
         const target = try allocator.create(AOFEntry);
@@ -85,7 +86,8 @@ pub const AOF = struct {
                 // different method to walk down AOF entries).
                 try self.validation_checksums.put(header.parent, {});
             } else {
-                assert(self.validation_checksums.get(header.parent) != null);
+                // (Null due to state sync skipping commits.)
+                maybe(self.validation_checksums.get(header.parent) == null);
             }
 
             try self.validation_checksums.put(header.checksum, {});
@@ -103,7 +105,11 @@ pub const AOF = struct {
         }
     }
 
-    pub fn write(self: *AOF, message: *const Message, options: struct { replica: u8, primary: u8 }) !void {
+    pub fn write(
+        self: *AOF,
+        message: *const Message.Prepare,
+        options: struct { replica: u8, primary: u8 },
+    ) !void {
         var entry: AOFEntry align(constants.sector_size) = undefined;
         entry.from_message(message, .{ .replica = options.replica, .primary = options.primary }, &self.last_checksum);
 

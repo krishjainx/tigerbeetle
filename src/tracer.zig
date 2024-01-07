@@ -253,12 +253,6 @@ pub const PlotId = union(enum) {
     cache_misses: struct {
         cache_name: []const u8,
     },
-    filter_block_hits: struct {
-        tree_name: []const u8,
-    },
-    filter_block_misses: struct {
-        tree_name: []const u8,
-    },
 
     pub fn format(
         plot_id: PlotId,
@@ -272,13 +266,11 @@ pub const PlotId = union(enum) {
             .queue_count => |args| try writer.print("queue_count({s})", .{args.queue_name}),
             .cache_hits => |args| try writer.print("cache_hits({s})", .{args.cache_name}),
             .cache_misses => |args| try writer.print("cache_misses({s})", .{args.cache_name}),
-            .filter_block_hits => |args| try writer.print("filter_block_hits({s})", .{args.tree_name}),
-            .filter_block_misses => |args| try writer.print("filter_block_misses({s})", .{args.tree_name}),
         };
     }
 };
 
-usingnamespace switch (constants.tracer_backend) {
+pub usingnamespace switch (constants.tracer_backend) {
     .none => TracerNone,
     .tracy => TracerTracy,
 };
@@ -409,7 +401,7 @@ const TracerTracy = struct {
     ) void {
         // The event must not already have been started.
         assert(slot.* == null);
-        c.___tracy_fiber_enter(intern_name(event.fiber()));
+        c.___tracy_fiber_enter(@as([*c]const u8, @ptrCast(intern_name(event.fiber()))));
         const name = intern_name(event);
         // TODO The alloc_srcloc here is not free and should be unnecessary,
         //      but the alloc-free version currently crashes:
@@ -426,11 +418,9 @@ const TracerTracy = struct {
     }
 
     pub fn end(slot: *?SpanStart, event: Event) void {
-        _ = event;
-
         // The event must already have been started.
         const tracy_context = slot.*.?;
-        c.___tracy_fiber_enter(intern_name(event.fiber()));
+        c.___tracy_fiber_enter(@as([*c]const u8, @ptrCast(intern_name(event.fiber()))));
         c.___tracy_emit_zone_end(tracy_context);
         slot.* = null;
     }
@@ -438,7 +428,7 @@ const TracerTracy = struct {
     pub fn plot(plot_id: PlotId, value: f64) void {
         // TODO We almost always want staircase plots, but can't configure this from zig yet.
         //      See https://github.com/wolfpld/tracy/issues/537.
-        c.___tracy_emit_plot(intern_name(plot_id), value);
+        c.___tracy_emit_plot(@as([*c]const u8, @ptrCast(intern_name(plot_id))), value);
     }
 
     pub fn log_fn(
@@ -458,73 +448,102 @@ const TracerTracy = struct {
             stdx.copy_disjoint(.exact, u8, message_buffer[message_buffer.len - dots.len ..], dots);
             break :message &message_buffer;
         };
-        c.___tracy_fiber_enter(intern_name(Fiber{ .main = {} }));
+        c.___tracy_fiber_enter(@as([*c]const u8, @ptrCast(intern_name(Fiber{ .main = {} }))));
         c.___tracy_emit_message(message.ptr, message.len, callstack_depth);
     }
 
     // Copied from zig/src/tracy.zig
-    pub const TracedAllocator = struct {
-        parent_allocator: std.mem.Allocator,
+    // This function only accepts comptime-known strings, see `messageColorCopy` for runtime strings
+    pub inline fn messageColor(comptime msg: [:0]const u8, color: u32) void {
+        c.___tracy_emit_messageLC(msg.ptr, color, callstack_depth);
+    }
+    pub fn TracyAllocator(comptime name: ?[:0]const u8) type {
+        return struct {
+            parent_allocator: std.mem.Allocator,
 
-        pub fn init(parent_allocator: std.mem.Allocator) TracedAllocator {
-            return .{
-                .parent_allocator = parent_allocator,
-            };
-        }
+            const Self = @This();
 
-        pub fn allocator(self: *TracedAllocator) std.mem.Allocator {
-            return std.mem.Allocator.init(self, allocFn, resizeFn, freeFn);
-        }
+            pub fn init(parent_allocator: std.mem.Allocator) Self {
+                return .{
+                    .parent_allocator = parent_allocator,
+                };
+            }
 
-        fn allocFn(
-            self: *TracedAllocator,
-            len: usize,
-            ptr_align: u29,
-            len_align: u29,
-            ret_addr: usize,
-        ) std.mem.Allocator.Error![]u8 {
-            const result = self.parent_allocator.rawAlloc(len, ptr_align, len_align, ret_addr);
-            if (result) |data| {
-                if (data.len != 0) {
-                    c.___tracy_emit_memory_alloc_callstack(data.ptr, data.len, callstack_depth, 0);
+            pub fn allocator(self: *Self) std.mem.Allocator {
+                return .{
+                    .ptr = self,
+                    .vtable = &.{
+                        .alloc = allocFn,
+                        .resize = resizeFn,
+                        .free = freeFn,
+                    },
+                };
+            }
+
+            fn allocFn(ptr: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
+                const self: *Self = @ptrCast(@alignCast(ptr));
+                const result = self.parent_allocator.rawAlloc(len, ptr_align, ret_addr);
+                if (result) |data| {
+                    if (len != 0) {
+                        if (name) |n| {
+                            allocNamed(data, len, n);
+                        } else {
+                            alloc(data, len);
+                        }
+                    }
+                } else {
+                    messageColor("allocation failed", 0xFF0000);
                 }
-            } else |_| {}
-            return result;
-        }
-
-        fn resizeFn(
-            self: *TracedAllocator,
-            buf: []u8,
-            buf_align: u29,
-            new_len: usize,
-            len_align: u29,
-            ret_addr: usize,
-        ) ?usize {
-            if (self.parent_allocator.rawResize(
-                buf,
-                buf_align,
-                new_len,
-                len_align,
-                ret_addr,
-            )) |resized_len| {
-                c.___tracy_emit_memory_free_callstack(buf.ptr, callstack_depth, 0);
-                c.___tracy_emit_memory_alloc_callstack(buf.ptr, resized_len, callstack_depth, 0);
-
-                return resized_len;
+                return result;
             }
 
-            // during normal operation the compiler hits this case thousands of times due to this
-            // emitting messages for it is both slow and causes clutter
-            return null;
-        }
+            fn resizeFn(ptr: *anyopaque, buf: []u8, buf_align: u8, new_len: usize, ret_addr: usize) bool {
+                const self: *Self = @ptrCast(@alignCast(ptr));
+                if (self.parent_allocator.rawResize(buf, buf_align, new_len, ret_addr)) {
+                    if (name) |n| {
+                        freeNamed(buf.ptr, n);
+                        allocNamed(buf.ptr, new_len, n);
+                    } else {
+                        free(buf.ptr);
+                        alloc(buf.ptr, new_len);
+                    }
 
-        fn freeFn(self: *TracedAllocator, buf: []u8, buf_align: u29, ret_addr: usize) void {
-            self.parent_allocator.rawFree(buf, buf_align, ret_addr);
-            // this condition is to handle free being called on an empty slice that was never even allocated
-            // example case: `std.process.getSelfExeSharedLibPaths` can return `&[_][:0]u8{}`
-            if (buf.len != 0) {
-                c.___tracy_emit_memory_free_callstack(buf.ptr, callstack_depth, 0);
+                    return true;
+                }
+
+                // during normal operation the compiler hits this case thousands of times due to this
+                // emitting messages for it is both slow and causes clutter
+                return false;
             }
-        }
-    };
+
+            fn freeFn(ptr: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+                const self: *Self = @ptrCast(@alignCast(ptr));
+                self.parent_allocator.rawFree(buf, buf_align, ret_addr);
+                // this condition is to handle free being called on an empty slice that was never even allocated
+                // example case: `std.process.getSelfExeSharedLibPaths` can return `&[_][:0]u8{}`
+                if (buf.len != 0) {
+                    if (name) |n| {
+                        freeNamed(buf.ptr, n);
+                    } else {
+                        free(buf.ptr);
+                    }
+                }
+            }
+        };
+    }
+    inline fn alloc(ptr: [*]u8, len: usize) void {
+        c.___tracy_emit_memory_alloc_callstack(ptr, len, callstack_depth, 0);
+    }
+
+    inline fn allocNamed(ptr: [*]u8, len: usize, comptime name: [:0]const u8) void {
+        c.___tracy_emit_memory_alloc_callstack_named(ptr, len, callstack_depth, 0, name.ptr);
+    }
+
+    inline fn free(ptr: [*]u8) void {
+        c.___tracy_emit_memory_free_callstack(ptr, callstack_depth, 0);
+    }
+
+    inline fn freeNamed(ptr: [*]u8, comptime name: [:0]const u8) void {
+        c.___tracy_emit_memory_free_callstack_named(ptr, callstack_depth, 0, name.ptr);
+    }
 };

@@ -8,11 +8,49 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const assert = std.debug.assert;
 
 const root = @import("root");
-// Allow setting build-time config either via `build.zig` `Options`, or via a struct in the root file.
-const build_options =
-    if (@hasDecl(root, "vsr_options")) root.vsr_options else @import("vsr_options");
+
+const BuildOptions = struct {
+    config_base: ConfigBase,
+    config_log_level: std.log.Level,
+    tracer_backend: TracerBackend,
+    hash_log_mode: HashLogMode,
+    config_aof_record: bool,
+    config_aof_recovery: bool,
+};
+
+// Allow setting build-time config either via `build.zig` `Options`, or via a struct in the root
+// file.
+const build_options: BuildOptions = blk: {
+    if (@hasDecl(root, "vsr_options")) {
+        break :blk root.vsr_options;
+    } else {
+        const vsr_options = @import("vsr_options");
+        // Zig's `addOptions` reuses the type, but redeclares it — identical structurally,
+        // but a different type from a nominal typing perspective.
+        var result: BuildOptions = undefined;
+        for (std.meta.fields(BuildOptions)) |field| {
+            @field(result, field.name) = launder_type(
+                field.type,
+                @field(vsr_options, field.name),
+            );
+        }
+        break :blk result;
+    }
+};
+
+fn launder_type(comptime T: type, comptime value: anytype) T {
+    if (T == bool) {
+        return value;
+    }
+    if (@typeInfo(T) == .Enum) {
+        assert(@typeInfo(@TypeOf(value)) == .Enum);
+        return @field(T, @tagName(value));
+    }
+    undefined;
+}
 
 const vsr = @import("vsr.zig");
 const sector_size = @import("constants.zig").sector_size;
@@ -39,6 +77,7 @@ const ConfigProcess = struct {
     verify: bool,
     port: u16 = 3001,
     address: []const u8 = "127.0.0.1",
+    storage_size_limit_max: u64 = 16 * 1024 * 1024 * 1024 * 1024,
     memory_size_max_default: u64 = 1024 * 1024 * 1024,
     cache_accounts_size_default: usize,
     cache_transfers_size_default: usize,
@@ -71,10 +110,11 @@ const ConfigProcess = struct {
     clock_synchronization_window_max_ms: u64 = 20000,
     grid_iops_read_max: u64 = 16,
     grid_iops_write_max: u64 = 16,
-    grid_repair_request_max: usize = 4,
-    grid_repair_reads_max: usize = 4,
-    grid_repair_writes_max: usize = 1,
     grid_cache_size_default: u64 = 1024 * 1024 * 1024,
+    grid_repair_request_max: usize = 8,
+    grid_repair_reads_max: usize = 8,
+    grid_missing_blocks_max: usize = 30,
+    grid_missing_tables_max: usize = 3,
     aof_record: bool = false,
     aof_recovery: bool = false,
 };
@@ -95,13 +135,17 @@ const ConfigCluster = struct {
     journal_slot_count: usize = 1024,
     message_size_max: usize = 1 * 1024 * 1024,
     superblock_copies: comptime_int = 4,
-    storage_size_max: u64 = 16 * 1024 * 1024 * 1024 * 1024,
-    block_size: comptime_int = 64 * 1024,
-    lsm_levels: u7 = 7,
+    block_size: comptime_int = 1024 * 1024,
+    lsm_levels: u6 = 7,
     lsm_growth_factor: u32 = 8,
-    lsm_batch_multiple: comptime_int = 64,
+    lsm_batch_multiple: comptime_int = 32,
     lsm_snapshots_max: usize = 32,
-    lsm_value_to_key_layout_ratio_min: comptime_int = 16,
+    lsm_manifest_compact_extra_blocks: comptime_int = 1,
+
+    // Arbitrary value.
+    // TODO(batiati): Maybe this constant should be derived from `grid_iops_read_max`,
+    // since each scan can read from `lsm_levels` in parallel.
+    lsm_scans_max: comptime_int = 8,
 
     /// The WAL requires at least two sectors of redundant headers — otherwise we could lose them all to
     /// a single torn write. A replica needs at least one valid redundant header to determine an
@@ -114,9 +158,10 @@ const ConfigCluster = struct {
     /// The smallest possible message_size_max (for use in the simulator to improve performance).
     /// The message body must have room for pipeline_prepare_queue_max headers in the DVC.
     pub fn message_size_max_min(clients_max: usize) usize {
-        return std.math.max(
+        return @max(
             sector_size,
             std.mem.alignForward(
+                usize,
                 @sizeOf(vsr.Header) + clients_max * @sizeOf(vsr.Header),
                 sector_size,
             ),
@@ -127,15 +172,14 @@ const ConfigCluster = struct {
     /// It is used to assert that all cluster members share the same config.
     pub fn checksum(comptime config: ConfigCluster) u128 {
         @setEvalBranchQuota(10_000);
-        var hasher = std.crypto.hash.Blake3.init(.{});
-        inline for (std.meta.fields(ConfigCluster)) |field| {
+        comptime var config_bytes: []const u8 = &.{};
+        comptime for (std.meta.fields(ConfigCluster)) |field| {
             const value = @field(config, field.name);
             const value_64 = @as(u64, value);
-            hasher.update(std.mem.asBytes(&value_64));
-        }
-        var target: [32]u8 = undefined;
-        hasher.final(&target);
-        return @bitCast(u128, target[0..@sizeOf(u128)].*);
+            assert(builtin.target.cpu.arch.endian() == .Little);
+            config_bytes = config_bytes ++ std.mem.asBytes(&value_64);
+        };
+        return vsr.checksum(config_bytes);
     }
 };
 
@@ -165,7 +209,10 @@ pub const configs = struct {
             .direct_io = true,
             .direct_io_required = true,
             .cache_accounts_size_default = @sizeOf(vsr.tigerbeetle.Account) * 1024 * 1024,
-            .cache_transfers_size_default = 0,
+            // TODO: Currently we need a non-zero cache size, because of how our CacheMap works.
+            // We should check if optimizing it to explicitly allow a zero cache size will increase
+            // performance, since the Transfer object cache isn't useful.
+            .cache_transfers_size_default = @sizeOf(vsr.tigerbeetle.Transfer) * 2048,
             .cache_transfers_posted_size_default = @sizeOf(u256) * 256 * 1024,
             .verify = false,
         },
@@ -182,7 +229,7 @@ pub const configs = struct {
             .direct_io = true,
             .direct_io_required = false,
             .cache_accounts_size_default = @sizeOf(vsr.tigerbeetle.Account) * 1024 * 1024,
-            .cache_transfers_size_default = 0,
+            .cache_transfers_size_default = @sizeOf(vsr.tigerbeetle.Transfer) * 2048,
             .cache_transfers_posted_size_default = @sizeOf(u256) * 256 * 1024,
             .verify = true,
         },
@@ -193,11 +240,16 @@ pub const configs = struct {
     /// Not suitable for production, but good for testing code that would be otherwise hard to reach.
     pub const test_min = Config{
         .process = .{
+            .storage_size_limit_max = 200 * 1024 * 1024,
             .direct_io = false,
             .direct_io_required = false,
             .cache_accounts_size_default = @sizeOf(vsr.tigerbeetle.Account) * 2048,
-            .cache_transfers_size_default = 0,
+            .cache_transfers_size_default = @sizeOf(vsr.tigerbeetle.Transfer) * 2048,
             .cache_transfers_posted_size_default = @sizeOf(u256) * 2048,
+            .grid_repair_request_max = 4,
+            .grid_repair_reads_max = 4,
+            .grid_missing_blocks_max = 3,
+            .grid_missing_tables_max = 2,
             .verify = true,
         },
         .cluster = .{
@@ -206,11 +258,12 @@ pub const configs = struct {
             .view_change_headers_suffix_max = 4 + 1,
             .journal_slot_count = Config.Cluster.journal_slot_count_min,
             .message_size_max = Config.Cluster.message_size_max_min(4),
-            .storage_size_max = 200 * 1024 * 1024,
 
             .block_size = sector_size,
             .lsm_batch_multiple = 4,
             .lsm_growth_factor = 4,
+            // (This is higher than the production default value because the block size is smaller.)
+            .lsm_manifest_compact_extra_blocks = 5,
         },
     };
 
@@ -218,7 +271,7 @@ pub const configs = struct {
     /// able to max out the LSM levels.
     pub const fuzz_min = config: {
         var base = test_min;
-        base.cluster.storage_size_max = 4 * 1024 * 1024 * 1024;
+        base.process.storage_size_limit_max = 1 * 1024 * 1024 * 1024;
         break :config base;
     };
 
@@ -238,12 +291,9 @@ pub const configs = struct {
         };
 
         // TODO Use additional build options to overwrite other fields.
-
-        // Zig's `addOptions` reuses the type, but redeclares it — identical structurally,
-        // but a different type from a nominal typing perspective.
-        base.process.log_level = @intToEnum(std.log.Level, @enumToInt(build_options.config_log_level));
-        base.process.tracer_backend = @intToEnum(TracerBackend, @enumToInt(build_options.tracer_backend));
-        base.process.hash_log_mode = @intToEnum(HashLogMode, @enumToInt(build_options.hash_log_mode));
+        base.process.log_level = build_options.config_log_level;
+        base.process.tracer_backend = build_options.tracer_backend;
+        base.process.hash_log_mode = build_options.hash_log_mode;
         base.process.aof_record = build_options.config_aof_record;
         base.process.aof_recovery = build_options.config_aof_recovery;
 

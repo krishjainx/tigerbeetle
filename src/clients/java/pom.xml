@@ -20,7 +20,7 @@
   </organization>
   <url>https://www.tigerbeetle.com</url>
   <scm>
-    <url>https://github.com/tigerbeetledb/tigerbeetle</url>
+    <url>https://github.com/tigerbeetle/tigerbeetle</url>
   </scm>
 
   <licenses>
@@ -162,6 +162,7 @@
               <exclude>com/tigerbeetle/PacketAcquireStatus.class</exclude>
               <exclude>com/tigerbeetle/InitializationStatus.class</exclude>
               <exclude>com/tigerbeetle/TransferFlags.class</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersFlags.class</exclude>
 
               <!-- Excluding the benchmark -->
               <exclude>benchmark/Benchmark.class</exclude>
@@ -187,6 +188,8 @@
               <exclude>com/tigerbeetle/PacketStatus.java</exclude>
               <exclude>com/tigerbeetle/TransferBatch.java</exclude>
               <exclude>com/tigerbeetle/TransferFlags.java</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersFlags.java</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersBatch.java</exclude>
             </excludes>
           </configuration>
         </plugin>
@@ -202,29 +205,52 @@
     </pluginManagement>
 
     <plugins>
-      <!-- Zig build -->
+      <!-- JNI tests -->
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.1.0</version>
+        <configuration>
+          <workingDirectory>${project.basedir}/../../../</workingDirectory>
+          <executable>${project.basedir}/../../../zig/zig</executable>
+        </configuration>
         <executions>
           <execution>
+            <!-- Zig test:jni -->
+            <?m2e ignore?>
+            <id>zig-jni-test</id>
+            <phase>validate</phase>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <environmentVariables>
+                  <JAVA_HOME>${java.home}</JAVA_HOME>
+              </environmentVariables>
+              <arguments>
+                <argument>build</argument>
+                <argument>test:jni</argument>
+              </arguments>
+            </configuration>
+          </execution>
+          <execution>
+            <!-- Zig build -->
             <?m2e ignore?>
             <id>zig-build</id>
             <phase>validate</phase>
             <goals>
               <goal>exec</goal>
             </goals>
+            <configuration>
+              <arguments>
+                <argument>build</argument>
+                <argument>java_client</argument>
+                <argument>-Drelease</argument>
+                <argument>-Dconfig=production</argument>
+              </arguments>
+            </configuration>
           </execution>
         </executions>
-        <configuration>
-          <workingDirectory>${project.basedir}/../../../</workingDirectory>
-          <executable>${project.basedir}/../../../scripts/build${script.extension}</executable>
-          <arguments>
-            <argument>java_client</argument>
-            <argument>-Drelease-safe</argument>
-          </arguments>
-        </configuration>
       </plugin>
 
       <!-- Formatter -->
@@ -316,7 +342,7 @@
                 </configuration>
             </execution>
         </executions>
-      </plugin>      
+      </plugin>
 
       <!-- Source code jar -->
       <plugin>
@@ -330,7 +356,7 @@
                 </goals>
             </execution>
         </executions>
-      </plugin>      
+      </plugin>
 
       <!-- Javadoc jar -->
       <plugin>
@@ -375,11 +401,12 @@
             <serverId>ossrh</serverId>
             <nexusUrl>https://s01.oss.sonatype.org</nexusUrl>
             <autoReleaseAfterClose>true</autoReleaseAfterClose>
+            <stagingProgressTimeoutMinutes>30</stagingProgressTimeoutMinutes>
         </configuration>
       </plugin>
     </plugins>
   </build>
-  
+
   <distributionManagement>
     <snapshotRepository>
       <id>ossrh</id>
@@ -389,5 +416,5 @@
       <id>ossrh</id>
       <url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
     </repository>
-  </distributionManagement>  
+  </distributionManagement>
 </project>

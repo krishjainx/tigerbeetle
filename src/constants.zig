@@ -7,7 +7,9 @@ const assert = std.debug.assert;
 const vsr = @import("vsr.zig");
 const tracer = @import("tracer.zig");
 const Config = @import("config.zig").Config;
-const config = @import("config.zig").configs.current;
+const stdx = @import("stdx.zig");
+
+pub const config = @import("config.zig").configs.current;
 
 /// The maximum log level.
 /// One of: .err, .warn, .info, .debug
@@ -29,8 +31,8 @@ pub const hash_log_mode = config.process.hash_log_mode;
 pub const replicas_max = 6;
 /// The maximum number of standbys allowed in a cluster.
 pub const standbys_max = 6;
-/// The maximum number of nodes (either standbys or active replicas) allowed in a cluster.
-pub const nodes_max = replicas_max + standbys_max;
+/// The maximum number of cluster members (either standbys or active replicas).
+pub const members_max = replicas_max + standbys_max;
 
 /// All operations <vsr_operations_reserved are reserved for the control protocol.
 /// All operations ≥vsr_operations_reserved are available for the state machine.
@@ -38,6 +40,23 @@ pub const vsr_operations_reserved: u8 = 128;
 
 comptime {
     assert(vsr_operations_reserved <= std.math.maxInt(u8));
+}
+
+pub const vsr_checkpoint_interval = journal_slot_count -
+    lsm_batch_multiple -
+    lsm_batch_multiple * stdx.div_ceil(pipeline_prepare_queue_max, lsm_batch_multiple);
+
+comptime {
+    // Invariant: to guarantee durability, a log entry from a previous checkpoint can be overwritten
+    // only when there is a quorum of replicas at the next checkpoint.
+    //
+    // This assert guarantees that when a prepare gets bumped from the log, there is a prepare
+    // _committed_ on top of the next checkpoint, which in turn guarantees the existence of a
+    // checkpoint quorum.
+    assert(vsr_checkpoint_interval + lsm_batch_multiple + pipeline_prepare_queue_max <=
+        journal_slot_count);
+    assert(vsr_checkpoint_interval >= lsm_batch_multiple);
+    assert(vsr_checkpoint_interval % lsm_batch_multiple == 0);
 }
 
 /// The maximum number of clients allowed per cluster, where each client has a unique 128-bit ID.
@@ -123,7 +142,7 @@ pub const journal_slot_count = config.cluster.journal_slot_count;
 /// Writes within this file never extend the filesystem inode size reducing the cost of fdatasync().
 /// This enables static allocation of disk space so that appends cannot fail with ENOSPC.
 /// This also enables us to detect filesystem inode corruption that would change the journal size.
-pub const journal_size_max = journal_size_headers + journal_size_prepares;
+pub const journal_size = journal_size_headers + journal_size_prepares;
 pub const journal_size_headers = journal_slot_count * @sizeOf(vsr.Header);
 pub const journal_size_prepares = journal_slot_count * message_size_max;
 
@@ -149,11 +168,11 @@ comptime {
     // another pipeline of messages. (See op_repair_min()).
     assert(journal_slot_count >= pipeline_prepare_queue_max * 2);
 
-    assert(journal_size_max == journal_size_headers + journal_size_prepares);
+    assert(journal_size == journal_size_headers + journal_size_prepares);
 }
 
 /// The maximum number of connections that can be held open by the server at any time:
-pub const connections_max = nodes_max + clients_max;
+pub const connections_max = members_max + clients_max;
 
 /// The maximum size of a message in bytes:
 /// This is also the limit of all inflight data across multiple pipelined requests per connection.
@@ -175,6 +194,10 @@ comptime {
 
     // Ensure that DVC/SV messages can fit all necessary headers.
     assert(message_body_size_max >= view_change_headers_max * @sizeOf(vsr.Header));
+
+    assert(message_body_size_max >= @sizeOf(vsr.ReconfigurationRequest));
+    assert(message_body_size_max >= @sizeOf(vsr.BlockRequest));
+    assert(message_body_size_max >= @sizeOf(vsr.CheckpointState));
 }
 
 /// The maximum number of Viewstamped Replication prepare messages that can be inflight at a time.
@@ -184,14 +207,7 @@ pub const pipeline_prepare_queue_max = config.cluster.pipeline_prepare_queue_max
 
 /// The maximum number of Viewstamped Replication request messages that can be queued at a primary,
 /// waiting to prepare.
-// TODO(Zig): After 0.10, change this to simply "clients_max -| pipeline_prepare_queue_max".
-// In Zig 0.9 compilation fails with "operation caused overflow" despite the saturating subtraction.
-// See: https://github.com/ziglang/zig/issues/10870
-pub const pipeline_request_queue_max =
-    if (clients_max < pipeline_prepare_queue_max)
-    0
-else
-    clients_max - pipeline_prepare_queue_max;
+pub const pipeline_request_queue_max = clients_max -| pipeline_prepare_queue_max;
 
 comptime {
     // A prepare-queue capacity larger than clients_max is wasted.
@@ -248,7 +264,7 @@ comptime {
 }
 
 /// The maximum number of headers to include with a response to a command=request_headers message.
-pub const request_headers_max = std.math.min(
+pub const request_headers_max = @min(
     @divFloor(message_body_size_max, @sizeOf(vsr.Header)),
     64,
 );
@@ -263,11 +279,31 @@ pub const grid_repair_request_max = config.process.grid_repair_request_max;
 /// The number of grid reads allocated to handle incoming command=request_blocks messages.
 pub const grid_repair_reads_max = config.process.grid_repair_reads_max;
 
-/// The number of grid writes allocated to handle incoming command=block messages.
-pub const grid_repair_writes_max = config.process.grid_repair_writes_max;
+/// Immediately after state sync we want access to all of the grid's write bandwidth to rapidly sync
+/// table blocks.
+pub const grid_repair_writes_max = grid_iops_write_max;
 
 /// The default sizing of the grid cache. It's expected for operators to override this on the CLI.
 pub const grid_cache_size_default = config.process.grid_cache_size_default;
+
+/// The maximum capacity (in *single* blocks – not counting syncing tables) of the
+/// GridBlocksMissing.
+///
+/// As this increases:
+/// - GridBlocksMissing allocates more memory.
+/// - The "period" of GridBlocksMissing's requests increases.
+///   This makes the repair protocol more tolerant of network latency.
+/// - (Repair protocol is used to repair manifest log blocks immediately after state sync).
+pub const grid_missing_blocks_max = config.process.grid_missing_blocks_max;
+
+/// The number of tables that can be synced simultaneously.
+/// "Table" in this context is the number of table index blocks to hold in memory while syncing
+/// their content.
+///
+/// As this increases:
+/// - GridBlocksMissing allocates more memory (~2 blocks for each).
+/// - Syncing is more efficient, as more blocks can be fetched concurrently.
+pub const grid_missing_tables_max = config.process.grid_missing_tables_max;
 
 comptime {
     assert(grid_repair_request_max > 0);
@@ -276,6 +312,11 @@ comptime {
 
     assert(grid_repair_reads_max > 0);
     assert(grid_repair_writes_max > 0);
+    assert(grid_repair_writes_max <=
+        grid_missing_blocks_max + grid_missing_tables_max * lsm_table_data_blocks_max);
+
+    assert(grid_missing_blocks_max > 0);
+    assert(grid_missing_tables_max > 0);
 }
 
 /// The minimum and maximum amount of time in milliseconds to wait before initiating a connection.
@@ -284,7 +325,7 @@ pub const connection_delay_min_ms = config.process.connection_delay_min_ms;
 pub const connection_delay_max_ms = config.process.connection_delay_max_ms;
 
 /// The maximum number of outgoing messages that may be queued on a replica connection.
-pub const connection_send_queue_max_replica = std.math.max(std.math.min(clients_max, 4), 2);
+pub const connection_send_queue_max_replica = @max(@min(clients_max, 4), 2);
 
 /// The maximum number of outgoing messages that may be queued on a client connection.
 /// The client has one in-flight request, and occasionally a ping.
@@ -408,8 +449,6 @@ comptime {
 ///
 /// The superblock contains local state for the replica and therefore cannot be replicated remotely.
 /// Loss of the superblock would represent loss of the replica and so it must be protected.
-/// Since each superblock copy also copies the superblock trailer (around 33 MiB), setting this
-/// beyond 4 copies (or decreasing block_size < 64 KiB) can result in a superblock zone > 264 MiB.
 ///
 /// This can mean checkpointing latencies in the rare extreme worst-case of at most 264ms, although
 /// this would require EWAH compression of our block free set to have zero effective compression.
@@ -429,10 +468,12 @@ comptime {
 /// The maximum size of a local data file.
 /// This should not be much larger than several TiB to limit:
 /// * blast radius and recovery time when a whole replica is lost,
-/// * replicated storage overhead, since all data files are mirrored,
-/// * the size of the superblock storage zone, and
+/// * replicated storage overhead, since all data files are mirrored, and
 /// * the static memory allocation required for tracking LSM forest metadata in memory.
-pub const storage_size_max = config.cluster.storage_size_max;
+///
+/// This is a "firm" limit --- while it is a compile-time constant, it does not affect data file
+/// layout and can be safely changed for an existing cluster.
+pub const storage_size_limit_max = config.process.storage_size_limit_max;
 
 /// The unit of read/write access to LSM manifest and LSM table blocks in the block storage zone.
 ///
@@ -452,16 +493,16 @@ comptime {
 pub const lsm_levels = config.cluster.lsm_levels;
 
 comptime {
-    // ManifestLog serializes the level as a u7.
+    // ManifestLog serializes the level as a u6.
     assert(lsm_levels > 0);
-    assert(lsm_levels <= std.math.maxInt(u7));
+    assert(lsm_levels <= std.math.maxInt(u6));
 }
 
 /// The number of tables at level i (0 ≤ i < lsm_levels) is `pow(lsm_growth_factor, i+1)`.
 /// A higher growth factor increases write amplification (by increasing the number of tables in
 /// level B that overlap a table in level A in a compaction), but decreases read amplification (by
 /// reducing the height of the tree and thus the number of levels that must be probed). Since read
-/// amplification can be optimized more easily (with filters and caching), we target a growth
+/// amplification can be optimized more easily (with caching), we target a growth
 /// factor of 8 for lower write amplification rather than the more typical growth factor of 10.
 pub const lsm_growth_factor = config.cluster.lsm_growth_factor;
 
@@ -469,9 +510,28 @@ pub const lsm_growth_factor = config.cluster.lsm_growth_factor;
 /// TODO Double-check this with our "LSM Manifest" spreadsheet.
 pub const lsm_manifest_node_size = config.process.lsm_manifest_node_size;
 
+/// The number of manifest blocks to compact *beyond the minimum*, per half-bar.
+///
+/// In the worst case, we still compact entries faster than we produce them (by a margin of
+/// "extra" blocks). This is necessary to ensure that the manifest has a bounded number of entries.
+/// (Or in other words, that Pace's recurrence relation converges.)
+///
+/// This specific choice of value is somewhat arbitrary, but yields a decent balance between
+/// "compaction work performed" and "total manifest size".
+///
+/// As this value increases, the manifest must perform more compaction work, but the manifest
+/// upper-bound shrinks (and therefore manifest recovery time decreases).
+///
+/// See ManifestLog.Pace for more detail.
+pub const lsm_manifest_compact_extra_blocks = config.cluster.lsm_manifest_compact_extra_blocks;
+
+comptime {
+    assert(lsm_manifest_compact_extra_blocks > 0);
+}
+
 /// A multiple of batch inserts that a mutable table can definitely accommodate before flushing.
 /// For example, if a message_size_max batch can contain at most 8181 transfers then a multiple of 4
-/// means that the transfer tree's mutable table will be sized to 8191 * 4 = 32764 transfers.
+/// means that the transfer tree's mutable table will be sized to 8190 * 4 = 32760 transfers.
 pub const lsm_batch_multiple = config.cluster.lsm_batch_multiple;
 
 comptime {
@@ -481,7 +541,19 @@ comptime {
 
 pub const lsm_snapshots_max = config.cluster.lsm_snapshots_max;
 
-pub const lsm_value_to_key_layout_ratio_min = config.cluster.lsm_value_to_key_layout_ratio_min;
+/// The maximum number of blocks that can possibly be referenced by any table index block.
+///
+/// - This is a very conservative (upper-bound) calculation that doesn't rely on the StateMachine's
+///   tree configuration. (To prevent Grid from depending on StateMachine).
+/// - This counts data blocks, but does not count the index block itself.
+pub const lsm_table_data_blocks_max = table_blocks_max: {
+    const checksum_size = @sizeOf(u256);
+    const address_size = @sizeOf(u64);
+    break :table_blocks_max @divFloor(
+        block_size - @sizeOf(vsr.Header),
+        (checksum_size + address_size),
+    );
+};
 
 /// The number of milliseconds between each replica tick, the basic unit of time in TigerBeetle.
 /// Used to regulate heartbeats, retries and timeouts, all specified as multiples of a tick.
@@ -550,3 +622,7 @@ pub const aof_record = config.process.aof_record;
 /// Place us in a special recovery state, where we accept timestamps passed in to us. Used to
 /// replay our AOF.
 pub const aof_recovery = config.process.aof_recovery;
+
+/// Maximum number of tree scans that can be performed by a single query.
+/// NOTE: Each condition in a query is a scan, for example `WHERE a=0 AND b=1` needs 2 scans.
+pub const lsm_scans_max = config.cluster.lsm_scans_max;

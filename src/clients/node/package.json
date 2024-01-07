@@ -6,7 +6,7 @@
   "typings": "dist/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tigerbeetledb/tigerbeetle.git",
+    "url": "git+https://github.com/tigerbeetle/tigerbeetle.git",
     "directory": "src/clients/node"
   },
   "preferUnplugged": true,
@@ -24,13 +24,8 @@
     "node": ">=14.0.0"
   },
   "scripts": {
-    "benchmark": "./scripts/benchmark.sh",
-    "test": "node dist/test",
-    "build": "npm run build_tsc && npm run build_lib",
-    "build_tsc": "./node_modules/typescript/bin/tsc",
-    "build_lib": "node scripts/windows_generate_node_lib.js && cd ../../.. && ./scripts/build.sh node_client -Drelease-safe",
-    "prepack": "npm run build && find dist/bin -name '*.o' -delete && for path in dist/bin/*; do mv ${path}/libtb_nodeclient.* ${path}/client.node; done",
-    "clean": "rm -rf build dist node_modules src/zig-cache zig"
+    "prepare": "node ./scripts/prepare.js",
+    "clean": "node ./scripts/clean.js"
   },
   "author": "TigerBeetle, Inc",
   "license": "Apache-2.0",

@@ -1,5 +1,26 @@
+//! Store the latest reply to every active client session.
+//!
+//! This allows them to be resent to the corresponding client if the client missed the original
+//! reply message (e.g. dropped packet).
+//!
+//! - Client replies' headers are stored in the `client_sessions` trailer.
+//! - Client replies (header and body) are only stored by ClientReplies in the `client_replies` zone
+//!   when `reply.header.size ≠ sizeOf(Header)` – that is, when the body is non-empty.
+//! - Corrupt client replies can be repaired from other replicas.
+//!
+//! Replies are written asynchronously. Subsequent writes for the same client may be coalesced –
+//! we only care about the last reply to each client session.
+//!
+//! ClientReplies guarantees that the latest replies are durable at checkpoint.
+//!
+//! If the same reply is corrupted by all replicas, the cluster is still available.
+//! If the respective client also never received the reply (due to a network fault), the client may
+//! be "locked out" of the cluster – continually retrying a request which has been executed, but
+//! whose reply has been permanently lost. This can be resolved by the operator restarting the
+//! client to create a new session.
 const std = @import("std");
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 const mem = std.mem;
 const log = std.log.scoped(.client_replies);
 
@@ -10,8 +31,8 @@ const IOPS = @import("../iops.zig").IOPS;
 const vsr = @import("../vsr.zig");
 const Message = @import("../message_pool.zig").MessagePool.Message;
 const MessagePool = @import("../message_pool.zig").MessagePool;
-const Slot = @import("superblock_client_sessions.zig").ReplySlot;
-const ClientSessions = @import("superblock_client_sessions.zig").ClientSessions;
+const Slot = @import("client_sessions.zig").ReplySlot;
+const ClientSessions = @import("client_sessions.zig").ClientSessions;
 
 const client_replies_iops_max =
     constants.client_replies_iops_read_max + constants.client_replies_iops_write_max;
@@ -31,16 +52,16 @@ pub fn ClientRepliesType(comptime Storage: type) type {
         const Read = struct {
             client_replies: *ClientReplies,
             completion: Storage.Read,
-            callback: fn (
+            callback: *const fn (
                 client_replies: *ClientReplies,
-                reply_header: *const vsr.Header,
-                reply: ?*Message,
+                reply_header: *const vsr.Header.Reply,
+                reply: ?*Message.Reply,
                 destination_replica: ?u8,
             ) void,
             slot: Slot,
-            message: *Message,
+            message: *Message.Reply,
             /// The header of the expected reply.
-            header: vsr.Header,
+            header: vsr.Header.Reply,
             destination_replica: ?u8,
         };
 
@@ -48,8 +69,12 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             client_replies: *ClientReplies,
             completion: Storage.Write,
             slot: Slot,
-            message: *Message,
+            message: *Message.Reply,
         };
+
+        const WriteQueue = RingBuffer(*Write, .{
+            .array = constants.client_replies_iops_write_max,
+        });
 
         storage: *Storage,
         message_pool: *MessagePool,
@@ -63,21 +88,22 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             std.StaticBitSet(constants.clients_max).initEmpty(),
         /// Track which slots hold a corrupt reply, or are otherwise missing the reply
         /// that ClientSessions believes they should hold.
+        ///
+        /// Invariants:
+        /// - Set bits must correspond to occupied slots in ClientSessions.
+        /// - Set bits must correspond to entries in ClientSessions with
+        ///   `header.size > @sizeOf(vsr.Header)`.
         faulty: std.StaticBitSet(constants.clients_max) =
             std.StaticBitSet(constants.clients_max).initEmpty(),
 
         /// Guard against multiple concurrent writes to the same slot.
         /// Pointers are into `writes`.
-        write_queue: RingBuffer(*Write, constants.client_replies_iops_write_max, .array) = .{},
+        write_queue: WriteQueue = WriteQueue.init(),
 
-        ready_next_tick: Storage.NextTick = undefined,
-        ready_callback: ?union(enum) {
-            next_tick: fn (*ClientReplies) void,
-            write: fn (*ClientReplies) void,
-        } = null,
+        ready_callback: ?*const fn (*ClientReplies) void = null,
 
         checkpoint_next_tick: Storage.NextTick = undefined,
-        checkpoint_callback: ?fn (*ClientReplies) void = null,
+        checkpoint_callback: ?*const fn (*ClientReplies) void = null,
 
         pub fn init(options: struct {
             storage: *Storage,
@@ -107,10 +133,12 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             client_replies: *ClientReplies,
             slot: Slot,
             session: *const ClientSessions.Entry,
-        ) ?*Message {
+        ) ?*Message.Reply {
             const client = session.header.client;
 
             if (client_replies.writing.isSet(slot.index)) {
+                assert(!client_replies.faulty.isSet(slot.index));
+
                 var writes = client_replies.writes.iterate();
                 var write_latest: ?*const Write = null;
                 while (writes.next()) |write| {
@@ -136,7 +164,12 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             client_replies: *ClientReplies,
             slot: Slot,
             session: *const ClientSessions.Entry,
-            callback: fn (*ClientReplies, *const vsr.Header, ?*Message, ?u8) void,
+            callback: *const fn (
+                *ClientReplies,
+                *const vsr.Header.Reply,
+                ?*Message.Reply,
+                ?u8,
+            ) void,
             destination_replica: ?u8,
         ) error{Busy}!void {
             assert(client_replies.read_reply_sync(slot, session) == null);
@@ -157,7 +190,7 @@ pub fn ClientRepliesType(comptime Storage: type) type {
                 session.header.checksum,
             });
 
-            const message = client_replies.message_pool.get_message();
+            const message = client_replies.message_pool.get_message(.reply);
             defer client_replies.message_pool.unref(message);
 
             read.* = .{
@@ -235,47 +268,64 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             callback(client_replies, &header, message, destination_replica);
         }
 
+        pub fn ready_sync(client_replies: *ClientReplies) bool {
+            maybe(client_replies.ready_callback == null);
+
+            return client_replies.writes.available() > 0;
+        }
+
+        /// Caller must check ready_sync() first.
         /// Call `callback` when ClientReplies is able to start another write_reply().
         pub fn ready(
             client_replies: *ClientReplies,
-            callback: fn (client_replies: *ClientReplies) void,
+            callback: *const fn (client_replies: *ClientReplies) void,
         ) void {
             assert(client_replies.ready_callback == null);
+            assert(!client_replies.ready_sync());
+            assert(client_replies.writes.available() == 0);
 
-            if (client_replies.writes.available() > 0) {
-                client_replies.ready_callback = .{ .next_tick = callback };
-                client_replies.storage.on_next_tick(
-                    ready_next_tick_callback,
-                    &client_replies.ready_next_tick,
-                );
-            } else {
-                // ready_callback will be called the next time a write completes.
-                client_replies.ready_callback = .{ .write = callback };
-            }
-        }
-
-        fn ready_next_tick_callback(next_tick: *Storage.NextTick) void {
-            const client_replies = @fieldParentPtr(ClientReplies, "ready_next_tick", next_tick);
-            assert(client_replies.writes.available() > 0);
-
-            const callback = client_replies.ready_callback.?.next_tick;
-            client_replies.ready_callback = null;
-            callback(client_replies);
+            // ready_callback will be called the next time a write completes.
+            client_replies.ready_callback = callback;
         }
 
         pub fn remove_reply(client_replies: *ClientReplies, slot: Slot) void {
+            maybe(client_replies.faulty.isSet(slot.index));
+
             client_replies.faulty.unset(slot.index);
         }
 
         /// The caller is responsible for ensuring that the ClientReplies is able to write
         /// by calling `write_reply()` after `ready()` finishes.
-        pub fn write_reply(client_replies: *ClientReplies, slot: Slot, message: *Message) void {
+        pub fn write_reply(
+            client_replies: *ClientReplies,
+            slot: Slot,
+            message: *Message.Reply,
+            trigger: enum { commit, repair },
+        ) void {
+            assert(client_replies.ready_sync());
             assert(client_replies.ready_callback == null);
             assert(client_replies.writes.available() > 0);
+            maybe(client_replies.writing.isSet(slot.index));
             assert(message.header.command == .reply);
             // There is never any need to write a body-less message, since the header is
-            // stored safely in the client sessions superblock trailer.
+            // stored safely in the `client_sessions` trailer.
             assert(message.header.size != @sizeOf(vsr.Header));
+
+            switch (trigger) {
+                .commit => {
+                    assert(client_replies.checkpoint_callback == null);
+                    maybe(client_replies.faulty.isSet(slot.index));
+                },
+                .repair => {
+                    maybe(client_replies.checkpoint_callback == null);
+                    assert(client_replies.faulty.isSet(slot.index));
+                },
+            }
+
+            // Clear the fault *before* the write completes, not after.
+            // Otherwise, a replica exiting state sync might mark a reply as faulty, then the
+            // ClientReplies clears that bit due to an unrelated write that was already queued.
+            client_replies.faulty.unset(slot.index);
 
             const write = client_replies.writes.acquire().?;
             write.* = .{
@@ -316,7 +366,7 @@ pub fn ClientRepliesType(comptime Storage: type) type {
                 // Zero sector padding to ensure deterministic storage.
                 const size = message.header.size;
                 const size_ceil = vsr.sector_ceil(size);
-                std.mem.set(u8, message.buffer[size..size_ceil], 0);
+                @memset(message.buffer[size..size_ceil], 0);
 
                 client_replies.writing.set(write.slot.index);
                 client_replies.storage.write_sectors(
@@ -333,6 +383,8 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             const write = @fieldParentPtr(ClientReplies.Write, "completion", completion);
             const client_replies = write.client_replies;
             const message = write.message;
+            assert(client_replies.writing.isSet(write.slot.index));
+            maybe(client_replies.faulty.isSet(write.slot.index));
 
             log.debug("{}: write_reply: wrote (client={} request={})", .{
                 client_replies.replica,
@@ -343,20 +395,14 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             // Release the write *before* invoking the callback, so that if the callback
             // checks .writes.available() we doesn't appear busy when we're not.
             client_replies.writing.unset(write.slot.index);
-            client_replies.faulty.unset(write.slot.index);
             client_replies.writes.release(write);
 
             client_replies.message_pool.unref(message);
             client_replies.write_reply_next();
 
             if (client_replies.ready_callback) |ready_callback| {
-                switch (ready_callback) {
-                    .write => |callback| {
-                        client_replies.ready_callback = null;
-                        callback(client_replies);
-                    },
-                    .next_tick => {},
-                }
+                client_replies.ready_callback = null;
+                ready_callback(client_replies);
             }
 
             if (client_replies.checkpoint_callback != null and
@@ -366,7 +412,7 @@ pub fn ClientRepliesType(comptime Storage: type) type {
             }
         }
 
-        pub fn checkpoint(client_replies: *ClientReplies, callback: fn (*ClientReplies) void) void {
+        pub fn checkpoint(client_replies: *ClientReplies, callback: *const fn (*ClientReplies) void) void {
             assert(client_replies.checkpoint_callback == null);
             client_replies.checkpoint_callback = callback;
 
@@ -374,6 +420,7 @@ pub fn ClientRepliesType(comptime Storage: type) type {
                 assert(client_replies.writing.count() == 0);
                 assert(client_replies.write_queue.count == 0);
                 client_replies.storage.on_next_tick(
+                    .vsr,
                     checkpoint_next_tick_callback,
                     &client_replies.checkpoint_next_tick,
                 );

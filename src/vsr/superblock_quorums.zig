@@ -82,8 +82,9 @@ pub fn QuorumsType(comptime options: Options) type {
         ///
         /// * When a member of the parent quorum is still present, verify that the highest quorum is
         ///   connected.
-        /// * When there are 2 quorums: 1/4 new and 3/4 old, favor the 3/4 old since the 1/4's
-        ///   trailers may be damaged.
+        /// * When there are 2 quorums: 1/4 new and 3/4 old, favor the 3/4 old since it is safer to
+        ///   repair.
+        ///   TODO Re-examine this now that there are no superblock trailers to worry about.
         pub fn working(
             quorums: *Quorums,
             copies: []SuperBlockHeader,
@@ -95,9 +96,9 @@ pub fn QuorumsType(comptime options: Options) type {
             quorums.array = undefined;
             quorums.count = 0;
 
-            for (copies) |*copy, index| quorums.count_copy(copy, index, threshold);
+            for (copies, 0..) |*copy, index| quorums.count_copy(copy, index, threshold);
 
-            std.sort.sort(Quorum, quorums.slice(), {}, sort_priority_descending);
+            std.mem.sort(Quorum, quorums.slice(), {}, sort_priority_descending);
 
             for (quorums.slice()) |quorum| {
                 if (quorum.copies.count() == options.superblock_copies) {
@@ -250,12 +251,12 @@ pub fn QuorumsType(comptime options: Options) type {
                 // for certain which copy this was supposed to be.
                 // We make the assumption that this was not a double-fault (corrupt + misdirect) —
                 // that is, the copy is in the correct slot, and its copy index is simply corrupt.
-                quorum.slots[slot] = @intCast(u8, slot);
+                quorum.slots[slot] = @as(u8, @intCast(slot));
                 quorum.copies.set(slot);
             } else if (quorum.copies.isSet(copy.copy)) {
                 // Ignore the duplicate copy.
             } else {
-                quorum.slots[slot] = @intCast(u8, copy.copy);
+                quorum.slots[slot] = @as(u8, @intCast(copy.copy));
                 quorum.copies.set(copy.copy);
             }
 
@@ -348,11 +349,11 @@ pub fn QuorumsType(comptime options: Options) type {
                 var a: ?u8 = null;
                 var b: ?u8 = null;
                 var c: ?u8 = null;
-                for (iterator.slots) |slot, i| {
-                    if (slot == null and !copies_any.isSet(i)) a = @intCast(u8, i);
-                    if (slot == null and copies_any.isSet(i)) b = @intCast(u8, i);
+                for (iterator.slots, 0..) |slot, i| {
+                    if (slot == null and !copies_any.isSet(i)) a = @as(u8, @intCast(i));
+                    if (slot == null and copies_any.isSet(i)) b = @as(u8, @intCast(i));
                     if (slot) |slot_copy| {
-                        if (slot_copy != i and copies_duplicate.isSet(slot_copy)) c = @intCast(u8, i);
+                        if (slot_copy != i and copies_duplicate.isSet(slot_copy)) c = @as(u8, @intCast(i));
                     }
                 }
 

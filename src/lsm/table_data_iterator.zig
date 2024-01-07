@@ -4,9 +4,12 @@ const math = std.math;
 const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
+const schema = @import("schema.zig");
 
 const stdx = @import("../stdx.zig");
-const GridType = @import("grid.zig").GridType;
+const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
+const Direction = @import("../direction.zig").Direction;
 
 /// A TableDataIterator iterates a table's data blocks in ascending key order.
 pub fn TableDataIteratorType(comptime Storage: type) type {
@@ -14,16 +17,16 @@ pub fn TableDataIteratorType(comptime Storage: type) type {
         const TableDataIterator = @This();
 
         const Grid = GridType(Storage);
-        const BlockPtrConst = Grid.BlockPtrConst;
 
-        pub const Callback = fn (it: *TableDataIterator, data_block: ?BlockPtrConst) void;
+        pub const Callback = *const fn (it: *TableDataIterator, data_block: ?BlockPtrConst) void;
 
         pub const Context = struct {
             grid: *Grid,
             /// Table data block addresses.
             addresses: []const u64,
             /// Table data block checksums.
-            checksums: []const u128,
+            checksums: []const schema.Checksum,
+            direction: Direction,
         };
 
         context: Context,
@@ -37,8 +40,18 @@ pub fn TableDataIteratorType(comptime Storage: type) type {
         read: Grid.Read,
         next_tick: Grid.NextTick,
 
-        pub fn init() !TableDataIterator {
-            return TableDataIterator{
+        pub fn init() TableDataIterator {
+            var it: TableDataIterator = undefined;
+            it.reset();
+            return it;
+        }
+
+        pub fn deinit(it: *TableDataIterator) void {
+            it.* = undefined;
+        }
+
+        pub fn reset(it: *TableDataIterator) void {
+            it.* = .{
                 .context = .{
                     .grid = undefined,
                     // The zero-init here is important.
@@ -46,15 +59,12 @@ pub fn TableDataIteratorType(comptime Storage: type) type {
                     // and get `null` rather than UB.
                     .addresses = &.{},
                     .checksums = &.{},
+                    .direction = .ascending,
                 },
                 .callback = .none,
                 .read = undefined,
                 .next_tick = undefined,
             };
-        }
-
-        pub fn deinit(it: *TableDataIterator) void {
-            it.* = undefined;
         }
 
         pub fn start(
@@ -81,27 +91,63 @@ pub fn TableDataIteratorType(comptime Storage: type) type {
         /// The block is only valid for the duration of the callback.
         pub fn next(it: *TableDataIterator, callback: Callback) void {
             assert(it.callback == .none);
+            assert(it.context.addresses.len == it.context.checksums.len);
 
             if (it.context.addresses.len > 0) {
-                const address = it.context.addresses[0];
-                const checksum = it.context.checksums[0];
+                const index: usize = switch (it.context.direction) {
+                    .ascending => 0,
+                    .descending => it.context.addresses.len - 1,
+                };
+
+                assert(it.context.checksums[index].padding == 0);
+
                 it.callback = .{ .read = callback };
-                it.context.grid.read_block(on_read, &it.read, address, checksum, .data);
+                it.context.grid.read_block(
+                    .{ .from_local_or_global_storage = on_read },
+                    &it.read,
+                    it.context.addresses[index],
+                    it.context.checksums[index].value,
+                    .{ .cache_read = true, .cache_write = true },
+                );
             } else {
                 it.callback = .{ .next_tick = callback };
                 it.context.grid.on_next_tick(on_next_tick, &it.next_tick);
             }
         }
 
-        fn on_read(read: *Grid.Read, block: Grid.BlockPtrConst) void {
+        fn on_read(read: *Grid.Read, block: BlockPtrConst) void {
             const it = @fieldParentPtr(TableDataIterator, "read", read);
             assert(it.callback == .read);
+            assert(it.context.addresses.len == it.context.checksums.len);
 
             const callback = it.callback.read;
             it.callback = .none;
-            it.context.addresses = it.context.addresses[1..];
-            it.context.checksums = it.context.checksums[1..];
 
+            switch (it.context.direction) {
+                .ascending => {
+                    if (constants.verify) {
+                        const header = schema.header_from_block(block);
+                        assert(header.address == it.context.addresses[0]);
+                        assert(header.checksum == it.context.checksums[0].value);
+                    }
+
+                    it.context.addresses = it.context.addresses[1..];
+                    it.context.checksums = it.context.checksums[1..];
+                },
+                .descending => {
+                    const index_last = it.context.checksums.len - 1;
+                    if (constants.verify) {
+                        const header = schema.header_from_block(block);
+                        assert(header.address == it.context.addresses[index_last]);
+                        assert(header.checksum == it.context.checksums[index_last].value);
+                    }
+
+                    it.context.addresses = it.context.addresses[0..index_last];
+                    it.context.checksums = it.context.checksums[0..index_last];
+                },
+            }
+
+            assert(it.context.addresses.len == it.context.checksums.len);
             callback(it, block);
         }
 

@@ -3,18 +3,18 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.state_machine);
 
 const stdx = @import("../stdx.zig");
-const constants = @import("../constants.zig");
 const vsr = @import("../vsr.zig");
+const global_constants = @import("../constants.zig");
 const GrooveType = @import("../lsm/groove.zig").GrooveType;
 const ForestType = @import("../lsm/forest.zig").ForestType;
 
 pub fn StateMachineType(
     comptime Storage: type,
-    comptime config: constants.StateMachineConfig,
+    comptime config: global_constants.StateMachineConfig,
 ) type {
     return struct {
         const StateMachine = @This();
-        const Grid = @import("../lsm/grid.zig").GridType(Storage);
+        const Grid = @import("../vsr/grid.zig").GridType(Storage);
 
         pub const Workload = WorkloadType(StateMachine);
 
@@ -22,21 +22,63 @@ pub fn StateMachineType(
             echo = config.vsr_operations_reserved + 0,
         };
 
+        pub const constants = struct {
+            pub const message_body_size_max = config.message_body_size_max;
+        };
+
+        pub const batch_logical_allowed = std.enums.EnumArray(Operation, bool).init(.{
+            // Batching not supported by test StateMachine.
+            .echo = false,
+        });
+
+        pub fn Event(comptime _: Operation) type {
+            return u8; // Must be non-zero-sized for sliceAsBytes().
+        }
+
+        pub fn Result(comptime _: Operation) type {
+            return u8; // Must be non-zero-sized for sliceAsBytes().
+        }
+
+        /// Empty demuxer to be compatible with vsr.Client batching.
+        pub fn DemuxerType(comptime operation: Operation) type {
+            return struct {
+                const Demuxer = @This();
+
+                reply: []Result(operation),
+                offset: u32 = 0,
+
+                pub fn init(reply: []Result(operation)) Demuxer {
+                    return .{ .reply = reply };
+                }
+
+                pub fn decode(self: *Demuxer, event_offset: u32, event_count: u32) []Result(operation) {
+                    assert(self.offset == event_offset);
+                    assert(event_offset + event_count <= self.reply.len);
+                    defer self.offset += event_count;
+                    return self.reply[self.offset..][0..event_count];
+                }
+            };
+        }
+
         pub const Options = struct {
             lsm_forest_node_count: u32,
         };
 
-        const Forest = ForestType(Storage, .{ .things = ThingGroove });
+        pub const Forest = ForestType(Storage, .{ .things = ThingGroove });
 
         const ThingGroove = GrooveType(
             Storage,
             Thing,
             .{
+                .ids = .{
+                    .timestamp = 1,
+                    .id = 2,
+                    .value = 3,
+                },
                 .value_count_max = .{
                     .timestamp = config.lsm_batch_multiple,
                     .id = config.lsm_batch_multiple,
-                    // ×2: modifying a 'value' both inserts the new Thing, and removes the old one.
-                    .value = 2 * config.lsm_batch_multiple,
+                    .value = config.lsm_batch_multiple,
                 },
                 .ignored = &[_][]const u8{},
                 .derived = .{},
@@ -56,7 +98,7 @@ pub fn StateMachineType(
         commit_timestamp: u64 = 0,
 
         prefetch_context: ThingGroove.PrefetchContext = undefined,
-        callback: ?fn (state_machine: *StateMachine) void = null,
+        callback: ?*const fn (state_machine: *StateMachine) void = null,
 
         pub fn init(allocator: std.mem.Allocator, grid: *Grid, options: Options) !StateMachine {
             var forest = try Forest.init(
@@ -65,9 +107,10 @@ pub fn StateMachineType(
                 options.lsm_forest_node_count,
                 .{
                     .things = .{
+                        .cache_entries_max = 2048,
                         .prefetch_entries_max = 1,
-                        .tree_options_object = .{ .cache_entries_max = 2048 },
-                        .tree_options_id = .{ .cache_entries_max = 2048 },
+                        .tree_options_object = .{},
+                        .tree_options_id = .{},
                         .tree_options_index = .{ .value = .{} },
                     },
                 },
@@ -84,7 +127,16 @@ pub fn StateMachineType(
             state_machine.forest.deinit(allocator);
         }
 
-        pub fn open(state_machine: *StateMachine, callback: fn (*StateMachine) void) void {
+        pub fn reset(state_machine: *StateMachine) void {
+            state_machine.forest.reset();
+
+            state_machine.* = .{
+                .options = state_machine.options,
+                .forest = state_machine.forest,
+            };
+        }
+
+        pub fn open(state_machine: *StateMachine, callback: *const fn (*StateMachine) void) void {
             assert(state_machine.callback == null);
 
             state_machine.callback = callback;
@@ -111,12 +163,11 @@ pub fn StateMachineType(
 
         pub fn prefetch(
             state_machine: *StateMachine,
-            callback: fn (*StateMachine) void,
+            callback: *const fn (*StateMachine) void,
             op: u64,
             operation: Operation,
             input: []align(16) const u8,
         ) void {
-            _ = op;
             _ = operation;
             _ = input;
 
@@ -125,7 +176,7 @@ pub fn StateMachineType(
 
             // TODO(Snapshots) Pass in the target snapshot.
             state_machine.forest.grooves.things.prefetch_setup(null);
-            state_machine.forest.grooves.things.prefetch_enqueue(123);
+            state_machine.forest.grooves.things.prefetch_enqueue(op);
             state_machine.forest.grooves.things.prefetch(prefetch_callback, &state_machine.prefetch_context);
         }
 
@@ -151,13 +202,13 @@ pub fn StateMachineType(
 
             switch (operation) {
                 .echo => {
-                    const thing = state_machine.forest.grooves.things.get(123);
-                    const key: u64 = if (thing) |t| t.timestamp else timestamp;
+                    const thing = state_machine.forest.grooves.things.get(op);
+                    assert(thing == null);
 
-                    state_machine.forest.grooves.things.put(&.{
-                        .timestamp = key,
-                        .id = 123,
-                        .value = @truncate(u64, vsr.checksum(input)),
+                    state_machine.forest.grooves.things.insert(&.{
+                        .timestamp = timestamp,
+                        .id = op,
+                        .value = @as(u64, @truncate(vsr.checksum(input))),
                     });
 
                     stdx.copy_disjoint(.inexact, u8, output, input);
@@ -168,7 +219,7 @@ pub fn StateMachineType(
 
         pub fn compact(
             state_machine: *StateMachine,
-            callback: fn (*StateMachine) void,
+            callback: *const fn (*StateMachine) void,
             op: u64,
         ) void {
             assert(op != 0);
@@ -188,7 +239,7 @@ pub fn StateMachineType(
 
         pub fn checkpoint(
             state_machine: *StateMachine,
-            callback: fn (*StateMachine) void,
+            callback: *const fn (*StateMachine) void,
         ) void {
             assert(state_machine.callback == null);
 
@@ -209,6 +260,7 @@ pub fn StateMachineType(
 fn WorkloadType(comptime StateMachine: type) type {
     return struct {
         const Workload = @This();
+        const constants = StateMachine.constants;
 
         random: std.rand.Random,
         requests_sent: usize = 0,

@@ -11,7 +11,7 @@ The TigerBeetle client for Node.js.
 ### Prerequisites
 
 Linux >= 5.6 is the only production environment we
-support. But for ease of development we also support macOS. Windows is not yet supported.
+support. But for ease of development we also support macOS and Windows.
 * NodeJS >= `14`
 
 ## Setup
@@ -21,7 +21,7 @@ First, create a directory for your project and `cd` into the directory.
 Then, install the TigerBeetle client:
 
 ```console
-$ npm install tigerbeetle-node
+npm install tigerbeetle-node
 ```
 
 Now, create `main.js` and copy this into it:
@@ -34,21 +34,11 @@ console.log("Import ok!");
 Finally, build and run:
 
 ```console
-$ node main.js
+node main.js
 ```
 
 Now that all prerequisites and dependencies are correctly set
 up, let's dig into using TigerBeetle.
-
-If you run into issues, check out the distribution-specific install
-steps that are run in CI to test support:
-
-* [Alpine](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_alpine.sh)
-* [Amazon Linux](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_amazonlinux.sh)
-* [Debian](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_debian.sh)
-* [Fedora](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_fedora.sh)
-* [Ubuntu](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_ubuntu.sh)
-* [RHEL](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_rhelubi.sh)
 
 ## Sample projects
 
@@ -59,6 +49,8 @@ features of TigerBeetle.
 * [Basic](/src/clients/node/samples/basic/): Create two accounts and transfer an amount between them.
 * [Two-Phase Transfer](/src/clients/node/samples/two-phase/): Create two accounts and start a pending transfer between
 them, then post the transfer.
+* [Many Two-Phase Transfers](/src/clients/node/samples/two-phase-many/): Create two accounts and start a number of pending transfer
+between them, posting and voiding alternating transfers.
 ### Sidenote: `BigInt`
 TigerBeetle uses 64-bit integers for many fields while JavaScript's
 builtin `Number` maximum value is `2^53-1`. The `n` suffix in JavaScript
@@ -74,9 +66,8 @@ addresses for all replicas in the cluster. The cluster
 ID and replica addresses are both chosen by the system that
 starts the TigerBeetle cluster.
 
-Clients are thread-safe. But for better
-performance, a single instance should be shared between
-multiple concurrent tasks.
+Clients are thread-safe and a single instance should be shared
+between multiple concurrent tasks.
 
 Multiple clients are useful when connecting to more than
 one TigerBeetle cluster.
@@ -87,7 +78,7 @@ environment variable and defaults to port `3000`.
 
 ```javascript
 const client = createClient({
-  cluster_id: 0,
+  cluster_id: 0n,
   replica_addresses: [process.env.TB_ADDRESS || '3000']
 });
 ```
@@ -105,15 +96,17 @@ reference](https://docs.tigerbeetle.com/reference/accounts).
 ```javascript
 let account = {
   id: 137n,
-  user_data: 0n,
-  reserved: Buffer.alloc(48, 0),
-  ledger: 1,
-  code: 718,
-  flags: 0,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 718,
+  flags: 0,
   timestamp: 0n,
 };
 
@@ -141,27 +134,31 @@ additionally has the `debits_must_not_exceed_credits` constraint:
 ```javascript
 let account0 = {
   id: 100n,
-  reserved: Buffer.alloc(48, 0),
-  user_data: 0n,
-  ledger: 1,
-  code: 1,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 1,
   timestamp: 0n,
   flags: 0,
 };
 let account1 = {
   id: 101n,
-  user_data: 0n,
-  reserved: Buffer.alloc(48, 0),
-  ledger: 1,
-  code: 1,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 1,
   timestamp: 0n,
   flags: 0,
 };
@@ -184,40 +181,46 @@ reference](https://docs.tigerbeetle.com/reference/operations/create_accounts).
 ```javascript
 let account2 = {
   id: 102n,
-  reserved: Buffer.alloc(48, 0),
-  user_data: 0n,
-  ledger: 1,
-  code: 1,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 1,
   timestamp: 0n,
   flags: 0,
 };
 let account3 = {
   id: 103n,
-  user_data: 0n,
-  reserved: Buffer.alloc(48, 0),
-  ledger: 1,
-  code: 1,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 1,
   timestamp: 0n,
   flags: 0,
 };
 let account4 = {
   id: 104n,
-  user_data: 0n,
-  reserved: Buffer.alloc(48, 0),
-  ledger: 1,
-  code: 1,
   debits_pending: 0n,
   debits_posted: 0n,
   credits_pending: 0n,
   credits_posted: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  reserved: 0,
+  ledger: 1,
+  code: 1,
   timestamp: 0n,
   flags: 0,
 };
@@ -252,18 +255,20 @@ distinguish accounts.
 ```javascript
 const accounts = await client.lookupAccounts([137n, 138n]);
 console.log(accounts);
-/*    
+/*
  * [{
  *   id: 137n,
- *   user_data: 0n,
- *   reserved: Buffer,
- *   ledger: 1,
- *   code: 718,
- *   flags: 0,
  *   debits_pending: 0n,
  *   debits_posted: 0n,
  *   credits_pending: 0n,
  *   credits_posted: 0n,
+ *   user_data_128: 0n,
+ *   user_data_64: 0n,
+ *   user_data_32: 0,
+ *   reserved: 0,
+ *   ledger: 1,
+ *   code: 718,
+ *   flags: 0,
  *   timestamp: 1623062009212508993n,
  * }]
  */
@@ -279,16 +284,17 @@ reference](https://docs.tigerbeetle.com/reference/transfers).
 ```javascript
 let transfer = {
   id: 1n,
-  pending_id: 0n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: 0,
-  amount: 10n,
   timestamp: 0n,
 };
 let transferErrors = await client.createTransfers([transfer]);
@@ -298,7 +304,7 @@ let transferErrors = await client.createTransfers([transfer]);
 
 The response is an empty array if all transfers were created
 successfully. If the response is non-empty, each object in the
-response array contains error information for an transfer that
+response array contains error information for a transfer that
 failed. The error object contains an error code and the index of the
 transfer in the request batch.
 
@@ -340,10 +346,10 @@ But the insert rate will be a *fraction* of
 potential. Instead, **always batch what you can**.
 
 The maximum batch size is set in the TigerBeetle server. The default
-is 8191.
+is 8190.
 
 ```javascript
-const BATCH_SIZE = 8191;
+const BATCH_SIZE = 8190;
 for (let i = 0; i < transfers.length; i += BATCH_SIZE) {
   const transferErrors = await client.createTransfers(transfers.slice(i, Math.min(transfers.length, BATCH_SIZE)));
   // error handling omitted
@@ -378,30 +384,32 @@ For example, to link `transfer0` and `transfer1`:
 ```javascript
 let transfer0 = {
   id: 2n,
-  pending_id: 0n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: 0,
-  amount: 10n,
   timestamp: 0n,
 };
 let transfer1 = {
   id: 3n,
-  pending_id: 0n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: 0,
-  amount: 10n,
   timestamp: 0n,
 };
 transfer0.flags = TransferFlags.linked;
@@ -428,32 +436,34 @@ appropriate accounts and apply them to the `debits_posted` and
 ```javascript
 let transfer2 = {
   id: 4n,
-  pending_id: 0n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: TransferFlags.pending,
-  amount: 10n,
   timestamp: 0n,
 };
 transferErrors = await client.createTransfers([transfer2]);
 
 let transfer3 = {
   id: 5n,
-  pending_id: 4n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 4n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: TransferFlags.post_pending_transfer,
-  amount: 10n,
   timestamp: 0n,
 };
 transferErrors = await client.createTransfers([transfer3]);
@@ -470,32 +480,34 @@ appropriate accounts and **not** apply them to the `debits_posted` and
 ```javascript
 let transfer4 = {
   id: 4n,
-  pending_id: 0n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 0n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: TransferFlags.pending,
-  amount: 10n,
   timestamp: 0n,
 };
 transferErrors = await client.createTransfers([transfer4]);
 
 let transfer5 = {
   id: 7n,
-  pending_id: 6n,
   debit_account_id: 102n,
   credit_account_id: 103n,
-  user_data: 0n,
-  reserved: 0n,
-  timeout: 0n,
+  amount: 10n,
+  pending_id: 6n,
+  user_data_128: 0n,
+  user_data_64: 0n,
+  user_data_32: 0,
+  timeout: 0,
   ledger: 1,
   code: 720,
   flags: TransferFlags.void_pending_transfer,
-  amount: 10n,
   timestamp: 0n,
 };
 transferErrors = await client.createTransfers([transfer5]);
@@ -521,19 +533,43 @@ console.log(transfers);
 /*
  * [{
  *   id: 1n,
- *   pending_id: 0n,
  *   debit_account_id: 102n,
  *   credit_account_id: 103n,
- *   user_data: 0n,
- *   reserved: 0n,
- *   timeout: 0n,
+ *   amount: 10n,
+ *   pending_id: 0n,
+ *   user_data_128: 0n,
+ *   user_data_64: 0n,
+ *   user_data_32: 0,
+ *   timeout: 0,
  *   ledger: 1,
  *   code: 720,
  *   flags: 0,
- *   amount: 10n,
  *   timestamp: 1623062009212508993n,
  * }]
  */
+```
+
+## Get Account Transfers
+
+NOTE: This is a preview API that is subject to breaking changes once we have
+a stable querying API.
+
+Fetches the transfers involving a given account, allowing basic filter and pagination
+capabilities.
+
+The transfers in the response are sorted by `timestamp` in chronological or
+reverse-chronological order.
+
+```javascript
+let filter = {
+  account_id: 2n,
+  timestamp: 0n, // No filter by Timestamp.
+  limit: 10, // Limit to ten transfers at most.
+  flags: GetAccountTransfersFlags.debits | // Include transfer from the debit side.
+    GetAccountTransfersFlags.credits | // Include transfer from the credit side.
+    GetAccountTransfersFlags.reversed, // Sort by timestamp in reverse-chronological order.
+}
+const account_transfers = await client.getAccountTransfers(filter)
 ```
 
 ## Linked Events
@@ -589,7 +625,7 @@ const errors = await client.createTransfers(batch);
  *  { index: 2, error: 1 },  // linked_event_failed
  *  { index: 3, error: 25 }, // exists
  *  { index: 4, error: 1 },  // linked_event_failed
- * 
+ *
  *  { index: 6, error: 17 }, // exists_with_different_flags
  *  { index: 7, error: 1 },  // linked_event_failed
  * ]
@@ -603,16 +639,25 @@ const errors = await client.createTransfers(batch);
 In a POSIX shell run:
 
 ```console
-$ git clone https://github.com/tigerbeetledb/tigerbeetle
-$ cd tigerbeetle
-$ git submodule update --init --recursive
-$ ./scripts/install_zig.sh
-$ cd src/clients/node
-$ npm install --include dev
-$ npm pack
+git clone https://github.com/tigerbeetle/tigerbeetle
+cd tigerbeetle
+git submodule update --init --recursive
+./scripts/install_zig.sh
+cd src/clients/node
+npm install --include dev
+npm pack
 ```
 
 ### On Windows
 
-Not yet supported.
+In PowerShell run:
 
+```console
+git clone https://github.com/tigerbeetle/tigerbeetle
+cd tigerbeetle
+git submodule update --init --recursive
+.\scripts\install_zig.bat
+cd src/clients/node
+npm install --include dev
+npm pack
+```

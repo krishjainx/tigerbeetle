@@ -11,7 +11,7 @@ fn find_node_client_tar(arena: *std.heap.ArenaAllocator, root: []const u8) ![]co
 
         const node_dir = try std.fs.cwd().realpathAlloc(arena.allocator(), "src/clients/node");
 
-        var dir = try std.fs.cwd().openDir(node_dir, .{ .iterate = true });
+        var dir = try std.fs.cwd().openIterableDir(node_dir, .{});
         defer dir.close();
 
         var walker = try dir.walk(arena.allocator());
@@ -66,18 +66,13 @@ pub const NodeDocs = Docs{
     .extension = "js",
     .proper_name = "Node.js",
 
-    // Phil: While installing TigerBeetle on Node 14 works, building
-    // (`npm install --include dev`) seems to require a newer Node
-    // version. I've tried this on alpine and debian images and
-    // couldn't get the install to work on either with Node 14.
-    .test_linux_docker_image = "node:16-alpine",
     .test_source_path = "",
 
     .name = "tigerbeetle-node",
-    .description = 
+    .description =
     \\The TigerBeetle client for Node.js.
     ,
-    .prerequisites = 
+    .prerequisites =
     \\* NodeJS >= `14`
     ,
 
@@ -87,13 +82,16 @@ pub const NodeDocs = Docs{
 
     .install_prereqs = "apk add -U python3",
 
-    .install_sample_file = 
+    .install_sample_file =
     \\const { createClient } = require("tigerbeetle-node");
     \\console.log("Import ok!");
     ,
 
     .install_commands = "npm install tigerbeetle-node",
-    .build_commands = "npm install typescript @types/node && npx tsc --allowJs --noEmit main.js",
+    .build_commands =
+    \\npm install typescript @types/node
+    \\npx tsc --allowJs --noEmit main.js
+    ,
     .run_commands = "node main.js",
 
     .current_commit_install_commands_hook = null,
@@ -103,18 +101,9 @@ pub const NodeDocs = Docs{
     .current_commit_pre_install_hook = null,
     .current_commit_post_install_hook = node_current_commit_post_install_hook,
 
-    .install_documentation = 
-    \\If you run into issues, check out the distribution-specific install
-    \\steps that are run in CI to test support:
-    \\
-    \\* [Alpine](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_alpine.sh)
-    \\* [Amazon Linux](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_amazonlinux.sh)
-    \\* [Debian](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_debian.sh)
-    \\* [Fedora](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_fedora.sh)
-    \\* [Ubuntu](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_ubuntu.sh)
-    \\* [RHEL](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/clients/node/scripts/test_install_on_rhelubi.sh)
-    ,
-    .examples = 
+    .install_documentation = "",
+
+    .examples =
     \\### Sidenote: `BigInt`
     \\TigerBeetle uses 64-bit integers for many fields while JavaScript's
     \\builtin `Number` maximum value is `2^53-1`. The `n` suffix in JavaScript
@@ -124,32 +113,34 @@ pub const NodeDocs = Docs{
     \\`BigInt(1)`.
     ,
 
-    .client_object_example = 
+    .client_object_example =
     \\const client = createClient({
-    \\  cluster_id: 0,
+    \\  cluster_id: 0n,
     \\  replica_addresses: [process.env.TB_ADDRESS || '3000']
     \\});
     ,
     .client_object_documentation = "",
-    .create_accounts_example = 
+    .create_accounts_example =
     \\let account = {
     \\  id: 137n,
-    \\  user_data: 0n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  ledger: 1,
-    \\  code: 718,
-    \\  flags: 0,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 718,
+    \\  flags: 0,
     \\  timestamp: 0n,
     \\};
     \\
     \\let accountErrors = await client.createAccounts([account]);
     ,
     .create_accounts_documentation = "",
-    .account_flags_documentation = 
+    .account_flags_documentation =
     \\To toggle behavior for an account, combine enum values stored in the
     \\`AccountFlags` object (in TypeScript it is an actual enum) with
     \\bitwise-or:
@@ -160,73 +151,83 @@ pub const NodeDocs = Docs{
     \\
     ,
 
-    .account_flags_example = 
+    .account_flags_example =
     \\let account0 = {
     \\  id: 100n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  user_data: 0n,
-    \\  ledger: 1,
-    \\  code: 1,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 1,
     \\  timestamp: 0n,
     \\  flags: 0,
     \\};
     \\let account1 = {
     \\  id: 101n,
-    \\  user_data: 0n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  ledger: 1,
-    \\  code: 1,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 1,
     \\  timestamp: 0n,
     \\  flags: 0,
     \\};
     \\account0.flags = AccountFlags.linked | AccountFlags.debits_must_not_exceed_credits;
     \\accountErrors = await client.createAccounts([account0, account1]);
     ,
-    .create_accounts_errors_example = 
+    .create_accounts_errors_example =
     \\let account2 = {
     \\  id: 102n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  user_data: 0n,
-    \\  ledger: 1,
-    \\  code: 1,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 1,
     \\  timestamp: 0n,
     \\  flags: 0,
     \\};
     \\let account3 = {
     \\  id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  ledger: 1,
-    \\  code: 1,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 1,
     \\  timestamp: 0n,
     \\  flags: 0,
     \\};
     \\let account4 = {
     \\  id: 104n,
-    \\  user_data: 0n,
-    \\  reserved: Buffer.alloc(48, 0),
-    \\  ledger: 1,
-    \\  code: 1,
     \\  debits_pending: 0n,
     \\  debits_posted: 0n,
     \\  credits_pending: 0n,
     \\  credits_posted: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  reserved: 0,
+    \\  ledger: 1,
+    \\  code: 1,
     \\  timestamp: 0n,
     \\  flags: 0,
     \\};
@@ -241,51 +242,54 @@ pub const NodeDocs = Docs{
     \\  }
     \\}
     ,
-    .create_accounts_errors_documentation = 
+    .create_accounts_errors_documentation =
     \\To handle errors you can either 1) exactly match error codes returned
     \\from `client.createAccounts` with enum values in the
     \\`CreateAccountError` object, or you can 2) look up the error code in
     \\the `CreateAccountError` object for a human-readable string.
     ,
-    .lookup_accounts_example = 
+    .lookup_accounts_example =
     \\const accounts = await client.lookupAccounts([137n, 138n]);
     \\console.log(accounts);
-    \\/*    
+    \\/*
     \\ * [{
     \\ *   id: 137n,
-    \\ *   user_data: 0n,
-    \\ *   reserved: Buffer,
-    \\ *   ledger: 1,
-    \\ *   code: 718,
-    \\ *   flags: 0,
     \\ *   debits_pending: 0n,
     \\ *   debits_posted: 0n,
     \\ *   credits_pending: 0n,
     \\ *   credits_posted: 0n,
+    \\ *   user_data_128: 0n,
+    \\ *   user_data_64: 0n,
+    \\ *   user_data_32: 0,
+    \\ *   reserved: 0,
+    \\ *   ledger: 1,
+    \\ *   code: 718,
+    \\ *   flags: 0,
     \\ *   timestamp: 1623062009212508993n,
     \\ * }]
     \\ */
     ,
 
-    .create_transfers_example = 
+    .create_transfers_example =
     \\let transfer = {
     \\  id: 1n,
-    \\  pending_id: 0n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: 0,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\let transferErrors = await client.createTransfers([transfer]);
     ,
     .create_transfers_documentation = "",
-    .create_transfers_errors_example = 
+    .create_transfers_errors_example =
     \\for (const error of transferErrors) {
     \\  switch (error.result) {
     \\    case CreateTransferError.exists:
@@ -296,29 +300,29 @@ pub const NodeDocs = Docs{
     \\  }
     \\}
     ,
-    .create_transfers_errors_documentation = 
+    .create_transfers_errors_documentation =
     \\To handle errors you can either 1) exactly match error codes returned
     \\from `client.createTransfers` with enum values in the
     \\`CreateTransferError` object, or you can 2) look up the error code in
     \\the `CreateTransferError` object for a human-readable string.
     ,
 
-    .no_batch_example = 
+    .no_batch_example =
     \\for (let i = 0; i < transfers.len; i++) {
     \\  const transferErrors = await client.createTransfers(transfers[i]);
     \\  // error handling omitted
     \\}
     ,
 
-    .batch_example = 
-    \\const BATCH_SIZE = 8191;
+    .batch_example =
+    \\const BATCH_SIZE = 8190;
     \\for (let i = 0; i < transfers.length; i += BATCH_SIZE) {
     \\  const transferErrors = await client.createTransfers(transfers.slice(i, Math.min(transfers.length, BATCH_SIZE)));
     \\  // error handling omitted
     \\}
     ,
 
-    .transfer_flags_documentation = 
+    .transfer_flags_documentation =
     \\To toggle behavior for a transfer, combine enum values stored in the
     \\`TransferFlags` object (in TypeScript it is an actual enum) with
     \\bitwise-or:
@@ -328,128 +332,147 @@ pub const NodeDocs = Docs{
     \\* `TransferFlags.post_pending_transfer`
     \\* `TransferFlags.void_pending_transfer`
     ,
-    .transfer_flags_link_example = 
+    .transfer_flags_link_example =
     \\let transfer0 = {
     \\  id: 2n,
-    \\  pending_id: 0n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: 0,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\let transfer1 = {
     \\  id: 3n,
-    \\  pending_id: 0n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: 0,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\transfer0.flags = TransferFlags.linked;
     \\// Create the transfer
     \\transferErrors = await client.createTransfers([transfer0, transfer1]);
     ,
-    .transfer_flags_post_example = 
+    .transfer_flags_post_example =
     \\let transfer2 = {
     \\  id: 4n,
-    \\  pending_id: 0n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: TransferFlags.pending,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\transferErrors = await client.createTransfers([transfer2]);
     \\
     \\let transfer3 = {
     \\  id: 5n,
-    \\  pending_id: 4n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 4n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: TransferFlags.post_pending_transfer,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\transferErrors = await client.createTransfers([transfer3]);
     ,
-    .transfer_flags_void_example = 
+    .transfer_flags_void_example =
     \\let transfer4 = {
     \\  id: 4n,
-    \\  pending_id: 0n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 0n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: TransferFlags.pending,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\transferErrors = await client.createTransfers([transfer4]);
     \\
     \\let transfer5 = {
     \\  id: 7n,
-    \\  pending_id: 6n,
     \\  debit_account_id: 102n,
     \\  credit_account_id: 103n,
-    \\  user_data: 0n,
-    \\  reserved: 0n,
-    \\  timeout: 0n,
+    \\  amount: 10n,
+    \\  pending_id: 6n,
+    \\  user_data_128: 0n,
+    \\  user_data_64: 0n,
+    \\  user_data_32: 0,
+    \\  timeout: 0,
     \\  ledger: 1,
     \\  code: 720,
     \\  flags: TransferFlags.void_pending_transfer,
-    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
     \\transferErrors = await client.createTransfers([transfer5]);
     ,
 
-    .lookup_transfers_example = 
+    .lookup_transfers_example =
     \\const transfers = await client.lookupTransfers([1n, 2n]);
     \\console.log(transfers);
     \\/*
     \\ * [{
     \\ *   id: 1n,
-    \\ *   pending_id: 0n,
     \\ *   debit_account_id: 102n,
     \\ *   credit_account_id: 103n,
-    \\ *   user_data: 0n,
-    \\ *   reserved: 0n,
-    \\ *   timeout: 0n,
+    \\ *   amount: 10n,
+    \\ *   pending_id: 0n,
+    \\ *   user_data_128: 0n,
+    \\ *   user_data_64: 0n,
+    \\ *   user_data_32: 0,
+    \\ *   timeout: 0,
     \\ *   ledger: 1,
     \\ *   code: 720,
     \\ *   flags: 0,
-    \\ *   amount: 10n,
     \\ *   timestamp: 1623062009212508993n,
     \\ * }]
     \\ */
     ,
 
-    .linked_events_example = 
+    .get_account_transfers_example =
+    \\let filter = {
+    \\  account_id: 2n,
+    \\  timestamp: 0n, // No filter by Timestamp.
+    \\  limit: 10, // Limit to ten transfers at most.
+    \\  flags: GetAccountTransfersFlags.debits | // Include transfer from the debit side.
+    \\    GetAccountTransfersFlags.credits | // Include transfer from the credit side.
+    \\    GetAccountTransfersFlags.reversed, // Sort by timestamp in reverse-chronological order.
+    \\}
+    \\const account_transfers = await client.getAccountTransfers(filter)
+    ,
+
+    .linked_events_example =
     \\const batch = [];
     \\let linkedFlag = 0;
     \\linkedFlag |= TransferFlags.linked;
@@ -484,16 +507,18 @@ pub const NodeDocs = Docs{
     \\ *  { index: 2, error: 1 },  // linked_event_failed
     \\ *  { index: 3, error: 25 }, // exists
     \\ *  { index: 4, error: 1 },  // linked_event_failed
-    \\ * 
+    \\ *
     \\ *  { index: 6, error: 17 }, // exists_with_different_flags
     \\ *  { index: 7, error: 1 },  // linked_event_failed
     \\ * ]
     \\ */
     ,
 
+    .developer_setup_documentation = "",
+
     // Extra steps to determine commit and repo so this works in
     // CI against forks and pull requests.
-    .developer_setup_sh_commands = 
+    .developer_setup_sh_commands =
     \\cd src/clients/node
     \\npm install --include dev
     \\npm pack
@@ -506,8 +531,12 @@ pub const NodeDocs = Docs{
 
     // Extra steps to determine commit and repo so this works in
     // CI against forks and pull requests.
-    .developer_setup_pwsh_commands = "",
-    .test_main_prefix = 
+    .developer_setup_pwsh_commands =
+    \\cd src/clients/node
+    \\npm install --include dev
+    \\npm pack
+    ,
+    .test_main_prefix =
     \\const {
     \\  createClient,
     \\  AccountFlags,
@@ -518,7 +547,7 @@ pub const NodeDocs = Docs{
     \\
     \\async function main() {
     ,
-    .test_main_suffix = 
+    .test_main_suffix =
     \\}
     \\main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
     ,

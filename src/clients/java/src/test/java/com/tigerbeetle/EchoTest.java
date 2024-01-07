@@ -9,15 +9,22 @@ import static org.junit.Assert.assertEquals;
 
 public class EchoTest {
 
-    static final int HEADER_SIZE = 128; // @sizeOf(vsr.Header)
+    static final int HEADER_SIZE = 256; // @sizeOf(vsr.Header)
     static final int TRANSFER_SIZE = 128; // @sizeOf(Transfer)
     static final int MESSAGE_SIZE_MAX = 1024 * 1024; // config.message_size_max
     static final int ITEMS_PER_BATCH = (MESSAGE_SIZE_MAX - HEADER_SIZE) / TRANSFER_SIZE;
 
+    // The number of times the same test is repeated, to stress the
+    // cycle of packet exhaustion followed by completions.
+    static final int repetitionsMax = 16;
+
+    // The number of concurrency requests on each cycle.
+    static final int concurrencyMax = 64;
+
     @Test(expected = AssertionError.class)
     public void testConstructorNullReplicaAddresses() throws Throwable {
 
-        try (var client = new EchoClient(0, null, 1)) {
+        try (var client = new EchoClient(UInt128.asBytes(0), null, 1)) {
 
         } catch (Throwable any) {
             throw any;
@@ -25,8 +32,9 @@ public class EchoTest {
     }
 
     @Test(expected = AssertionError.class)
-    public void testConstructorNegativeCluster() throws Throwable {
-        try (var client = new EchoClient(-1, "3000", 1)) {
+    public void testConstructorInvalidCluster() throws Throwable {
+        var clusterInvalid = new byte[] {1, 2, 3};
+        try (var client = new EchoClient(clusterInvalid, "3000", 1)) {
 
         } catch (Throwable any) {
             throw any;
@@ -35,7 +43,7 @@ public class EchoTest {
 
     @Test(expected = AssertionError.class)
     public void testConstructorNegativeConcurrencyMax() throws Throwable {
-        try (var client = new EchoClient(0, "3000", -1)) {
+        try (var client = new EchoClient(UInt128.asBytes(0), "3000", -1)) {
 
         } catch (Throwable any) {
             throw any;
@@ -46,7 +54,7 @@ public class EchoTest {
     public void testEchoAccounts() throws Throwable {
         final Random rnd = new Random(1);
 
-        try (var client = new EchoClient(0, "3000", 32)) {
+        try (var client = new EchoClient(UInt128.asBytes(0), "3000", 32)) {
             final var batch = new AccountBatch(getRandomData(rnd, AccountBatch.Struct.SIZE));
             final var reply = client.echo(batch);
             assertBatchesEqual(batch, reply);
@@ -57,7 +65,7 @@ public class EchoTest {
     public void testEchoTransfers() throws Throwable {
         final Random rnd = new Random(2);
 
-        try (var client = new EchoClient(0, "3000", 32)) {
+        try (var client = new EchoClient(UInt128.asBytes(0), "3000", 32)) {
             final var batch = new TransferBatch(getRandomData(rnd, TransferBatch.Struct.SIZE));
             final var future = client.echoAsync(batch);
             final var reply = future.join();
@@ -74,12 +82,7 @@ public class EchoTest {
         };
 
         final Random rnd = new Random(3);
-        final int concurrencyMax = 64;
-        try (var client = new EchoClient(0, "3000", concurrencyMax)) {
-
-            // Repeating the same test multiple times to stress the
-            // cycle of message exhaustion followed by completions.
-            final int repetitionsMax = 100;
+        try (var client = new EchoClient(UInt128.asBytes(0), "3000", concurrencyMax)) {
             for (int repetition = 0; repetition < repetitionsMax; repetition++) {
 
                 final var list = new ArrayList<AsyncContext>();
@@ -139,12 +142,7 @@ public class EchoTest {
         }
 
         final Random rnd = new Random(4);
-        final int concurrencyMax = 64;
-        try (var client = new EchoClient(0, "3000", concurrencyMax)) {
-
-            // Repeating the same test multiple times to stress the
-            // cycle of message exhaustion followed by completions.
-            final int repetitionsMax = 100;
+        try (var client = new EchoClient(UInt128.asBytes(0), "3000", concurrencyMax)) {
             for (int repetition = 0; repetition < repetitionsMax; repetition++) {
 
                 final var list = new ArrayList<ThreadContext>();

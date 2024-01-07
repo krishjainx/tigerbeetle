@@ -9,8 +9,10 @@ const log = std.log.scoped(.io);
 const tracer = @import("../tracer.zig");
 
 const constants = @import("../constants.zig");
+const stdx = @import("../stdx.zig");
 const FIFO = @import("../fifo.zig").FIFO;
 const buffer_limit = @import("../io.zig").buffer_limit;
+const parse_dirty_semver = stdx.parse_dirty_semver;
 
 pub const IO = struct {
     ring: IO_Uring,
@@ -31,9 +33,8 @@ pub const IO = struct {
     pub fn init(entries: u12, flags: u32) !IO {
         // Detect the linux version to ensure that we support all io_uring ops used.
         const uts = std.os.uname();
-        const release = std.mem.sliceTo(&uts.release, 0);
-        const version = try std.builtin.Version.parse(release);
-        if (version.order(std.builtin.Version{ .major = 5, .minor = 5 }) == .lt) {
+        const version = try parse_dirty_semver(&uts.release);
+        if (version.order(std.SemanticVersion{ .major = 5, .minor = 5, .patch = 0 }) == .lt) {
             @panic("Linux kernel 5.5 or greater is required for io_uring OP_ACCEPT");
         }
 
@@ -102,7 +103,7 @@ pub const IO = struct {
             self.ios_queued += 1;
             tracer.plot(
                 .{ .queue_count = .{ .queue_name = "io_queued" } },
-                @intToFloat(f64, self.ios_queued),
+                @as(f64, @floatFromInt(self.ios_queued)),
             );
 
             // The amount of time this call will block is bounded by the timeout we just submitted:
@@ -173,10 +174,10 @@ pub const IO = struct {
                     // it was completed due to the completion of an event, in which case `cqe.res`
                     // would be 0. It is possible for multiple timeout operations to complete at the
                     // same time if the nanoseconds value passed to `run_for_ns()` is very short.
-                    if (-cqe.res == @enumToInt(os.E.TIME)) etime.* = true;
+                    if (-cqe.res == @intFromEnum(os.E.TIME)) etime.* = true;
                     continue;
                 }
-                const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
+                const completion = @as(*Completion, @ptrFromInt(@as(usize, @intCast(cqe.user_data))));
                 completion.result = cqe.res;
                 // We do not run the completion here (instead appending to a linked list) to avoid:
                 // * recursion through `flush_submissions()` and `flush_completions()`,
@@ -187,7 +188,7 @@ pub const IO = struct {
 
             tracer.plot(
                 .{ .queue_count = .{ .queue_name = "io_in_kernel" } },
-                @intToFloat(f64, self.ios_in_kernel),
+                @as(f64, @floatFromInt(self.ios_in_kernel)),
             );
 
             if (completed < cqes.len) break;
@@ -213,11 +214,11 @@ pub const IO = struct {
             self.ios_in_kernel += submitted;
             tracer.plot(
                 .{ .queue_count = .{ .queue_name = "io_queued" } },
-                @intToFloat(f64, self.ios_queued),
+                @as(f64, @floatFromInt(self.ios_queued)),
             );
             tracer.plot(
                 .{ .queue_count = .{ .queue_name = "io_in_kernel" } },
-                @intToFloat(f64, self.ios_in_kernel),
+                @as(f64, @floatFromInt(self.ios_in_kernel)),
             );
 
             break;
@@ -236,7 +237,7 @@ pub const IO = struct {
         self.ios_queued += 1;
         tracer.plot(
             .{ .queue_count = .{ .queue_name = "io_queued" } },
-            @intToFloat(f64, self.ios_queued),
+            @as(f64, @floatFromInt(self.ios_queued)),
         );
     }
 
@@ -247,7 +248,7 @@ pub const IO = struct {
         next: ?*Completion = null,
         operation: Operation,
         context: ?*anyopaque,
-        callback: fn (context: ?*anyopaque, completion: *Completion, result: *const anyopaque) void,
+        callback: *const fn (context: ?*anyopaque, completion: *Completion, result: *const anyopaque) void,
 
         fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
             switch (completion.operation) {
@@ -297,15 +298,15 @@ pub const IO = struct {
                     );
                 },
             }
-            sqe.user_data = @ptrToInt(completion);
+            sqe.user_data = @intFromPtr(completion);
         }
 
         fn complete(completion: *Completion, callback_tracer_slot: *?tracer.SpanStart) void {
             switch (completion.operation) {
                 .accept => {
-                    const result = blk: {
+                    const result: anyerror!os.socket_t = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -327,15 +328,15 @@ pub const IO = struct {
                             };
                             break :blk err;
                         } else {
-                            break :blk @intCast(os.socket_t, completion.result);
+                            break :blk @as(os.socket_t, @intCast(completion.result));
                         }
                     };
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .close => {
-                    const result = blk: {
+                    const result: anyerror!void = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
                                 .BADF => error.FileDescriptorInvalid,
                                 .DQUOT => error.DiskQuota,
@@ -351,9 +352,9 @@ pub const IO = struct {
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .connect => {
-                    const result = blk: {
+                    const result: anyerror!void = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -385,9 +386,9 @@ pub const IO = struct {
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .read => {
-                    const result = blk: {
+                    const result: anyerror!usize = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -409,15 +410,15 @@ pub const IO = struct {
                             };
                             break :blk err;
                         } else {
-                            break :blk @intCast(usize, completion.result);
+                            break :blk @as(usize, @intCast(completion.result));
                         }
                     };
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .recv => {
-                    const result = blk: {
+                    const result: anyerror!usize = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -437,15 +438,15 @@ pub const IO = struct {
                             };
                             break :blk err;
                         } else {
-                            break :blk @intCast(usize, completion.result);
+                            break :blk @as(usize, @intCast(completion.result));
                         }
                     };
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .send => {
-                    const result = blk: {
+                    const result: anyerror!usize = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -472,14 +473,14 @@ pub const IO = struct {
                             };
                             break :blk err;
                         } else {
-                            break :blk @intCast(usize, completion.result);
+                            break :blk @as(usize, @intCast(completion.result));
                         }
                     };
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .timeout => {
                     assert(completion.result < 0);
-                    const result = switch (@intToEnum(os.E, -completion.result)) {
+                    const result: anyerror!void = switch (@as(os.E, @enumFromInt(-completion.result))) {
                         .INTR => {
                             completion.io.enqueue(completion);
                             return;
@@ -491,9 +492,9 @@ pub const IO = struct {
                     call_callback(completion, &result, callback_tracer_slot);
                 },
                 .write => {
-                    const result = blk: {
+                    const result: anyerror!usize = blk: {
                         if (completion.result < 0) {
-                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                            const err = switch (@as(os.E, @enumFromInt(-completion.result))) {
                                 .INTR => {
                                     completion.io.enqueue(completion);
                                     return;
@@ -516,7 +517,7 @@ pub const IO = struct {
                             };
                             break :blk err;
                         } else {
-                            break :blk @intCast(usize, completion.result);
+                            break :blk @as(usize, @intCast(completion.result));
                         }
                     };
                     call_callback(completion, &result, callback_tracer_slot);
@@ -611,9 +612,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const AcceptError!os.socket_t, @ptrToInt(res)).*,
+                        @as(*const AcceptError!os.socket_t, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -653,9 +654,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const CloseError!void, @ptrToInt(res)).*,
+                        @as(*const CloseError!void, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -704,9 +705,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const ConnectError!void, @ptrToInt(res)).*,
+                        @as(*const ConnectError!void, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -752,9 +753,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const ReadError!usize, @ptrToInt(res)).*,
+                        @as(*const ReadError!usize, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -799,9 +800,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
+                        @as(*const RecvError!usize, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -850,9 +851,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const SendError!usize, @ptrToInt(res)).*,
+                        @as(*const SendError!usize, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -886,9 +887,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*,
+                        @as(*const TimeoutError!void, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -901,7 +902,7 @@ pub const IO = struct {
 
         // Special case a zero timeout as a yield.
         if (nanoseconds == 0) {
-            completion.result = -@intCast(i32, @enumToInt(std.os.E.TIME));
+            completion.result = -@as(i32, @intCast(@intFromEnum(std.os.E.TIME)));
             self.completed.push(completion);
             return;
         }
@@ -943,9 +944,9 @@ pub const IO = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*anyopaque, comp: *Completion, res: *const anyopaque) void {
                     callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
+                        @ptrCast(@alignCast(ctx)),
                         comp,
-                        @intToPtr(*const WriteError!usize, @ptrToInt(res)).*,
+                        @as(*const WriteError!usize, @ptrCast(@alignCast(res))).*,
                     );
                 }
             }.wrapper,
@@ -1002,7 +1003,16 @@ pub const IO = struct {
         if (@hasDecl(os.O, "LARGEFILE")) flags |= os.O.LARGEFILE;
 
         var direct_io_supported = false;
-        if (constants.direct_io) {
+        var dir_on_tmpfs = try fs_is_tmpfs(dir_fd);
+
+        if (dir_on_tmpfs) {
+            log.warn("tmpfs is not durable, and your data will be lost on reboot", .{});
+        }
+
+        // Special case. tmpfs doesn't support Direct I/O. Normally we would panic here (see below)
+        // but being able to benchmark production workloads on tmpfs is very useful for removing
+        // disk speed from the equation.
+        if (constants.direct_io and !dir_on_tmpfs) {
             direct_io_supported = try fs_supports_direct_io(dir_fd);
             if (direct_io_supported) {
                 flags |= os.O.DIRECT;
@@ -1091,6 +1101,23 @@ pub const IO = struct {
         return fd;
     }
 
+    /// Detects whether the underlying file system for a given directory fd is tmpfs. This is used
+    /// to relax our Direct I/O check - running on tmpfs for benchmarking is useful.
+    fn fs_is_tmpfs(dir_fd: std.os.fd_t) !bool {
+        var statfs: stdx.StatFs = undefined;
+
+        while (true) {
+            const res = stdx.fstatfs(dir_fd, &statfs);
+            switch (os.linux.getErrno(res)) {
+                .SUCCESS => {
+                    return statfs.f_type == stdx.TmpfsMagic;
+                },
+                .INTR => continue,
+                else => |err| return os.unexpectedErrno(err),
+            }
+        }
+    }
+
     /// Detects whether the underlying file system for a given directory fd supports Direct I/O.
     /// Not all Linux file systems support `O_DIRECT`, e.g. a shared macOS volume.
     fn fs_supports_direct_io(dir_fd: std.os.fd_t) !bool {
@@ -1106,7 +1133,7 @@ pub const IO = struct {
             const res = os.linux.openat(dir_fd, path, os.O.CLOEXEC | os.O.RDONLY | os.O.DIRECT, 0);
             switch (os.linux.getErrno(res)) {
                 .SUCCESS => {
-                    os.close(@intCast(os.fd_t, res));
+                    os.close(@as(os.fd_t, @intCast(res)));
                     return true;
                 },
                 .INTR => continue,
@@ -1121,7 +1148,7 @@ pub const IO = struct {
     fn fs_allocate(fd: os.fd_t, size: u64) !void {
         const mode: i32 = 0;
         const offset: i64 = 0;
-        const length = @intCast(i64, size);
+        const length = @as(i64, @intCast(size));
 
         while (true) {
             const rc = os.linux.fallocate(fd, mode, offset, length);

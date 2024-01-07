@@ -25,23 +25,19 @@
 //!
 const std = @import("std");
 const assert = std.debug.assert;
-const allocator = std.testing.allocator;
 
 const log = std.log.scoped(.lsm_manifest_level_fuzz);
 const constants = @import("../constants.zig");
 const fuzz = @import("../testing/fuzz.zig");
 const binary_search = @import("binary_search.zig");
 const lsm = @import("tree.zig");
+const allocator = fuzz.allocator;
 
 const Key = u64;
 const Value = struct {
     key: Key,
     tombstone: bool,
 };
-
-inline fn compare_keys(a: Key, b: Key) std.math.Order {
-    return std.math.order(a, b);
-}
 
 inline fn key_from_value(value: *const Value) Key {
     return value.key;
@@ -58,7 +54,6 @@ inline fn tombstone(value: *const Value) bool {
 const Table = @import("table.zig").TableType(
     Key,
     Value,
-    compare_keys,
     key_from_value,
     std.math.maxInt(Key),
     tombstone,
@@ -75,7 +70,7 @@ pub fn main() !void {
     var prng = std.rand.DefaultPrng.init(args.seed);
     const random = prng.random();
 
-    const fuzz_op_count = std.math.min(
+    const fuzz_op_count = @min(
         args.events_max orelse @as(usize, 2e5),
         fuzz.random_int_exponential(random, usize, 1e5),
     );
@@ -122,7 +117,7 @@ fn generate_fuzz_ops(
         .remove_invisible = 3,
         .remove_visible = 3,
     };
-    log.info("fuzz_op_distribution = {d:.2}", .{fuzz_op_distribution});
+    log.info("fuzz_op_distribution = {:.2}", .{fuzz_op_distribution});
 
     var ctx = GenerateContext{ .max_inserted = table_count_max, .random = random };
     for (fuzz_ops) |*fuzz_op| {
@@ -144,7 +139,7 @@ const GenerateContext = struct {
         switch (fuzz_op_tag) {
             .insert_tables => {
                 // If there's no room for new tables, existing ones should be removed.
-                const insertable = @minimum(ctx.max_inserted - ctx.inserted, max_tables_per_insert);
+                const insertable = @min(ctx.max_inserted - ctx.inserted, max_tables_per_insert);
                 if (insertable == 0) {
                     // Decide whether to remove visible or invisible tables:
                     if (ctx.invisible > 0) return ctx.next(.remove_invisible);
@@ -236,7 +231,6 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
             NodePool,
             Key,
             TableInfo,
-            compare_keys,
             table_count_max,
         );
         pub const TableInfo = @import("manifest.zig").TableInfoType(Table);
@@ -277,7 +271,7 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
         }
 
         pub fn run_fuzz_ops(env: *Environment, fuzz_ops: []const FuzzOp) !void {
-            for (fuzz_ops) |fuzz_op, op_index| {
+            for (fuzz_ops, 0..) |fuzz_op, op_index| {
                 log.debug("Running fuzz_ops[{}/{}] == {}", .{ op_index, fuzz_ops.len, fuzz_op });
                 switch (fuzz_op) {
                     .insert_tables => |amount| try env.insert_tables(amount),
@@ -317,11 +311,10 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
 
             // Insert the generated tables into the Environment for reference:
             for (tables) |*table| {
-                const index = binary_search.binary_search_values_raw(
+                const index = binary_search.binary_search_values_upsert_index(
                     Key,
                     TableInfo,
                     key_min_from_table,
-                    compare_keys,
                     env.tables.items,
                     table.key_max,
                     .{},
@@ -338,33 +331,32 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
 
         fn generate_non_overlapping_table(env: *Environment, key: Key) TableInfo {
             var new_key_min = key + env.random.uintLessThanBiased(Key, 31) + 1;
-            assert(compare_keys(new_key_min, key) == .gt);
+            assert(new_key_min > key);
 
-            var i = binary_search.binary_search_values_raw(
+            var i = binary_search.binary_search_values_upsert_index(
                 Key,
                 TableInfo,
                 key_min_from_table,
-                compare_keys,
                 env.tables.items,
                 new_key_min,
                 .{},
             );
 
             if (i > 0) {
-                if (compare_keys(new_key_min, env.tables.items[i - 1].key_max) != .gt) {
+                if (new_key_min <= env.tables.items[i - 1].key_max) {
                     new_key_min = env.tables.items[i - 1].key_max + 1;
                 }
             }
 
             const next_key_min = for (env.tables.items[i..]) |table| {
-                switch (compare_keys(new_key_min, table.key_min)) {
+                switch (std.math.order(new_key_min, table.key_min)) {
                     .lt => break table.key_min,
                     .eq => new_key_min = table.key_max + 1,
                     .gt => unreachable,
                 }
             } else std.math.maxInt(Key);
 
-            const max_delta = @minimum(32, next_key_min - 1 - new_key_min);
+            const max_delta = @min(32, next_key_min - 1 - new_key_min);
             const new_key_max = new_key_min + env.random.uintAtMostBiased(Key, max_delta);
 
             return .{
@@ -398,7 +390,7 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
                 assert(level_table.equal(env_table));
 
                 env.level.set_snapshot_max(env.snapshot, .{
-                    .table_info = @intToPtr(*TableInfo, @ptrToInt(level_table)),
+                    .table_info = @constCast(level_table),
                     .generation = env.level.generation,
                 });
                 // This is required to keep the table in the fuzzer's environment consistent with
@@ -416,11 +408,10 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
         }
 
         fn find_exact(env: *Environment, level_table: *const TableInfo) *TableInfo {
-            const index = binary_search.binary_search_values_raw(
+            const index = binary_search.binary_search_values_upsert_index(
                 Key,
                 TableInfo,
                 key_min_from_table,
-                compare_keys,
                 env.tables.items,
                 level_table.key_min,
                 .{},
@@ -429,9 +420,9 @@ pub fn EnvironmentType(comptime table_count_max: u32, comptime node_size: u32) t
             assert(index < env.tables.items.len);
             const tables = env.tables.items[index..];
 
-            assert(compare_keys(tables[0].key_min, level_table.key_min) == .eq);
+            assert(tables[0].key_min == level_table.key_min);
             for (tables) |*env_table| {
-                if (compare_keys(env_table.key_max, level_table.key_max) == .eq) {
+                if (env_table.key_max == level_table.key_max) {
                     return env_table;
                 }
             }

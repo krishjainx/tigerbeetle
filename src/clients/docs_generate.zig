@@ -1,21 +1,28 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const assert = std.debug.assert;
+
+const flags = @import("../flags.zig");
 
 const Docs = @import("./docs_types.zig").Docs;
 const go = @import("./go/docs.zig").GoDocs;
 const node = @import("./node/docs.zig").NodeDocs;
 const java = @import("./java/docs.zig").JavaDocs;
+const dotnet = @import("./dotnet/docs.zig").DotnetDocs;
 const samples = @import("./docs_samples.zig").samples;
 const TmpDir = @import("./shutil.zig").TmpDir;
+const file_or_directory_exists =
+    @import("./shutil.zig").file_or_directory_exists;
 const git_root = @import("./shutil.zig").git_root;
 const shell_wrap = @import("./shutil.zig").shell_wrap;
 const run_shell = @import("./shutil.zig").run_shell;
 const cmd_sep = @import("./shutil.zig").cmd_sep;
-const write_shell_newlines_into_single_line = @import("./shutil.zig").write_shell_newlines_into_single_line;
+const write_shell_newlines_into_single_line =
+    @import("./shutil.zig").write_shell_newlines_into_single_line;
 const run_shell_with_env = @import("./shutil.zig").run_shell_with_env;
 const run_with_tb = @import("./run_with_tb.zig").run_with_tb;
 
-const languages = [_]Docs{ go, node, java };
+const languages = [_]Docs{ go, node, java, dotnet };
 
 const MarkdownWriter = struct {
     buf: *std.ArrayList(u8),
@@ -58,11 +65,7 @@ const MarkdownWriter = struct {
 
     fn commands(mw: *MarkdownWriter, content: []const u8) void {
         mw.print("```console\n", .{});
-        var splits = std.mem.split(u8, content, "\n");
-        while (splits.next()) |chunk| {
-            mw.print("$ {s}\n", .{chunk});
-        }
-
+        mw.print("{s}\n", .{content});
         mw.print("```\n\n", .{});
     }
 
@@ -78,106 +81,120 @@ const MarkdownWriter = struct {
         mw.buf.clearRetainingCapacity();
     }
 
-    fn diffOnDisk(mw: *MarkdownWriter, filename: []const u8) !bool {
-        const file = std.fs.cwd().createFile(
-            filename,
-            .{ .read = true, .truncate = false },
-        ) catch |e| {
-            std.debug.print("Could not open file for reading: {s}.\n", .{filename});
-            return e;
+    fn diff_on_disk(mw: *MarkdownWriter, filename: []const u8) !enum { same, different } {
+        const file = std.fs.cwd().openFile(filename, .{}) catch {
+            // If the file isn't accessible/doesn't exist, yes, we
+            // should overwrite it.
+            return .different;
         };
-        const fSize = (try file.stat()).size;
-        if (fSize != mw.buf.items.len) {
-            return true;
-        }
 
         var buf = std.mem.zeroes([4096]u8);
-        var cursor: usize = 0;
-        while (cursor < fSize) {
-            var maxCanRead = if (fSize - cursor > 4096) 4096 else fSize - cursor;
-            // Phil: Sometimes this infinite loops and returns `0` but
-            // I don't know why. Allowing it to just overwrite solves the problem.
-            var n = try file.read(buf[0..maxCanRead]);
-            if (n == 0 and maxCanRead != n) {
-                return true;
+        var remaining = mw.buf.items;
+
+        while (true) {
+            var n = try file.read(&buf);
+            if (n == 0) {
+                return if (remaining.len == 0) .same else .different;
             }
 
-            if (std.mem.eql(u8, buf[0..], mw.buf.items[cursor..n])) {
-                return false;
+            if (std.mem.startsWith(u8, remaining, buf[0..n])) {
+                remaining = remaining[n..];
+            } else {
+                return .different;
             }
         }
-
-        return true;
     }
 
     // save() only actually writes the buffer to disk if it has
     // changed compared to what's on disk, so that file modify time stays
     // reasonable.
     fn save(mw: *MarkdownWriter, filename: []const u8) !void {
-        var diff = try mw.diffOnDisk(filename);
-        if (!diff) {
-            return;
+        // Ensure a single trailing newline.
+        assert(std.mem.endsWith(u8, mw.buf.items, "\n\n"));
+        _ = mw.buf.pop();
+        assert(!std.mem.endsWith(u8, mw.buf.items, "\n\n"));
+        assert(std.mem.endsWith(u8, mw.buf.items, "\n"));
+
+        if (try mw.diff_on_disk(filename) == .different) {
+            try std.fs.cwd().writeFile(filename, mw.buf.items);
         }
-
-        const file = try std.fs.cwd().openFile(
-            filename,
-            .{ .write = true },
-        );
-        defer file.close();
-
-        // First truncate(0) the file.
-        try file.setEndPos(0);
-
-        // Then write what we need.
-        try file.writeAll(mw.buf.items);
     }
 };
 
-pub fn prepare_directory_and_integrate(
+pub fn prepare_directory(
     arena: *std.heap.ArenaAllocator,
     language: Docs,
     dir: []const u8,
-    integrate: bool,
 ) !void {
-    var cmd = std.ArrayList(u8).init(arena.allocator());
-    defer cmd.deinit();
+    // Some languages (Java) have an additional project file
+    // (pom.xml) they need to have available.
+    if (language.project_file.len > 0) {
+        const project_file_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ dir, language.project_file_name },
+        );
+        try std.fs.cwd().writeFile(project_file_path, language.project_file);
+    }
 
     const root = try git_root(arena);
-
     if (language.current_commit_pre_install_hook) |hook| {
         try hook(arena, dir, root);
     }
 
-    // Then run project, within tmp dir
+    // Then set up project, within tmp dir
     try std.os.chdir(dir);
+    defer std.os.chdir(root) catch unreachable;
 
-    cmd.clearRetainingCapacity();
-    try write_shell_newlines_into_single_line(&cmd, if (language.current_commit_install_commands_hook) |hook|
-        try hook(arena, language.install_commands)
-    else
-        language.install_commands);
+    var cmd = std.ArrayList(u8).init(arena.allocator());
+    defer cmd.deinit();
+
+    try write_shell_newlines_into_single_line(
+        &cmd,
+        if (language.current_commit_install_commands_hook) |hook|
+            try hook(arena, language.install_commands)
+        else
+            language.install_commands,
+    );
     try run_shell(arena, cmd.items);
+}
+
+pub fn integrate(
+    arena: *std.heap.ArenaAllocator,
+    language: Docs,
+    dir: []const u8,
+    run: bool,
+) !void {
+    const root = try git_root(arena);
 
     if (language.current_commit_post_install_hook) |hook| {
         try hook(arena, dir, root);
-
-        // Reset cwd
-        try std.os.chdir(dir);
     }
 
-    cmd.clearRetainingCapacity();
-    try write_shell_newlines_into_single_line(&cmd, if (language.current_commit_build_commands_hook) |hook|
-        try hook(arena, language.build_commands)
-    else
-        language.build_commands);
+    // Run project within dir
+    try std.os.chdir(dir);
+    defer std.os.chdir(root) catch unreachable;
+
+    var cmd = std.ArrayList(u8).init(arena.allocator());
+    defer cmd.deinit();
+
+    try write_shell_newlines_into_single_line(
+        &cmd,
+        if (language.current_commit_build_commands_hook) |hook|
+            try hook(arena, language.build_commands)
+        else
+            language.build_commands,
+    );
     try run_shell(arena, cmd.items);
 
-    if (integrate) {
+    if (run) {
         cmd.clearRetainingCapacity();
-        try write_shell_newlines_into_single_line(&cmd, if (language.current_commit_run_commands_hook) |hook|
-            try hook(arena, language.run_commands)
-        else
-            language.run_commands);
+        try write_shell_newlines_into_single_line(
+            &cmd,
+            if (language.current_commit_run_commands_hook) |hook|
+                try hook(arena, language.run_commands)
+            else
+                language.run_commands,
+        );
 
         try run_with_tb(arena, try shell_wrap(arena, cmd.items), dir);
     }
@@ -212,7 +229,14 @@ const Generator = struct {
         try std.fs.cwd().makePath(path);
     }
 
-    fn build_file_within_project(self: Generator, tmp_dir: TmpDir, file: []const u8, run_setup_tests: bool) !void {
+    fn build_file_within_project(
+        self: Generator,
+        tmp_dir: TmpDir,
+        file: []const u8,
+        run_setup_tests: bool,
+    ) !void {
+        try prepare_directory(self.arena, self.language, tmp_dir.path);
+
         var tmp_file_name = self.sprintf(
             "{s}/{s}{s}.{s}",
             .{
@@ -223,27 +247,11 @@ const Generator = struct {
             },
         );
         try self.ensure_path(std.fs.path.dirname(tmp_file_name).?);
-        var tmp_file = try std.fs.cwd().createFile(tmp_file_name, .{
-            .truncate = true,
-        });
-        defer tmp_file.close();
-        _ = try tmp_file.write(file);
 
-        // Some languages (Java) have an additional project file
-        // (pom.xml) they need to have available.
-        if (self.language.project_file.len > 0) {
-            const project_file = try std.fs.cwd().createFile(
-                self.sprintf(
-                    "{s}/{s}",
-                    .{ tmp_dir.path, self.language.project_file_name },
-                ),
-                .{ .truncate = true },
-            );
-            defer project_file.close();
+        try std.fs.cwd().writeFile(tmp_file_name, file);
 
-            _ = try project_file.write(self.language.project_file);
-        }
-
+        const root = try git_root(self.arena);
+        try std.os.chdir(root);
         var cmd = std.ArrayList(u8).init(self.arena.allocator());
         // First run general setup within already cloned repo
         try write_shell_newlines_into_single_line(&cmd, if (builtin.os.tag == .windows)
@@ -253,6 +261,7 @@ const Generator = struct {
 
         var env = std.ArrayList([]const u8).init(self.arena.allocator());
         defer env.deinit();
+
         if (run_setup_tests) {
             try env.appendSlice(&[_][]const u8{ "TEST", "true" });
         }
@@ -263,8 +272,8 @@ const Generator = struct {
         );
 
         // TODO: JavaScript integration is not yet working.
-        const integrate = !std.mem.eql(u8, self.language.markdown_name, "javascript");
-        try prepare_directory_and_integrate(self.arena, self.language, tmp_dir.path, integrate);
+        const run = !std.mem.eql(u8, self.language.markdown_name, "javascript");
+        try integrate(self.arena, self.language, tmp_dir.path, run);
     }
 
     fn print(self: Generator, msg: []const u8) void {
@@ -286,26 +295,35 @@ const Generator = struct {
         ) catch unreachable;
     }
 
-    fn validate_minimal(self: Generator, keepTmp: bool) !void {
+    fn validate_minimal(self: Generator, keep_tmp: bool) !void {
         // Test the sample file
         self.print("Building minimal sample file");
         var tmp_dir = try TmpDir.init(self.arena);
-        defer if (!keepTmp) tmp_dir.deinit();
+        defer if (!keep_tmp) tmp_dir.deinit();
+
         try self.build_file_within_project(tmp_dir, self.language.install_sample_file, true);
     }
 
-    fn validate_aggregate(self: Generator, keepTmp: bool) !void {
+    fn validate_aggregate(self: Generator, keep_tmp: bool) !void {
         // Test major parts of sample code
         var sample = try self.make_aggregate_sample();
+        self.print("Aggregate");
+        var line_no: u32 = 0;
+        var lines = std.mem.split(u8, sample, "\n");
+        while (lines.next()) |line| {
+            line_no += 1;
+            std.debug.print("{: >3} {s}\n", .{ line_no, line });
+        }
         self.print("Building aggregate sample file");
         var tmp_dir = try TmpDir.init(self.arena);
-        defer if (!keepTmp) tmp_dir.deinit();
+        defer if (!keep_tmp) tmp_dir.deinit();
+
         try self.build_file_within_project(tmp_dir, sample, false);
     }
 
     const tests = [_]struct {
         name: []const u8,
-        validate: fn (Generator, bool) anyerror!void,
+        validate: *const fn (Generator, bool) anyerror!void,
     }{
         .{
             .name = "minimal",
@@ -330,10 +348,13 @@ const Generator = struct {
             self.language.lookup_accounts_example,
             self.language.create_transfers_example,
             self.language.create_transfers_errors_example,
+            self.language.lookup_transfers_example,
+            self.language.get_account_transfers_example,
+            self.language.no_batch_example,
+            self.language.batch_example,
             self.language.transfer_flags_link_example,
             self.language.transfer_flags_post_example,
             self.language.transfer_flags_void_example,
-            self.language.lookup_transfers_example,
             self.language.linked_events_example,
             self.language.test_main_suffix,
         };
@@ -344,10 +365,15 @@ const Generator = struct {
         return aggregate.items;
     }
 
-    fn generate_language_setup_steps(self: Generator, mw: *MarkdownWriter, directory_info: []const u8, include_project_file: bool) void {
+    fn generate_language_setup_steps(
+        self: Generator,
+        mw: *MarkdownWriter,
+        directory_info: []const u8,
+        include_project_file: bool,
+    ) void {
         var language = self.language;
 
-        const windowsSupported: []const u8 = if (language.developer_setup_pwsh_commands.len > 0)
+        const windows_supported: []const u8 = if (language.developer_setup_pwsh_commands.len > 0)
             " and Windows"
         else
             ". Windows is not yet supported";
@@ -355,7 +381,7 @@ const Generator = struct {
             \\Linux >= 5.6 is the only production environment we
             \\support. But for ease of development we also support macOS{s}.
             \\
-        , .{windowsSupported});
+        , .{windows_supported});
         mw.paragraph(language.prerequisites);
 
         mw.header(2, "Setup");
@@ -372,6 +398,15 @@ const Generator = struct {
 
         mw.paragraph("Then, install the TigerBeetle client:");
         mw.commands(language.install_commands);
+    }
+
+    fn sample_exists(self: Generator, sample: @TypeOf(samples[0])) !bool {
+        const root = try git_root(self.arena);
+        return file_or_directory_exists(try std.fmt.allocPrint(
+            self.arena.allocator(),
+            "{s}/src/clients/{s}/samples/{s}/",
+            .{ root, self.language.directory, sample.directory },
+        ));
     }
 
     fn generate_main_readme(self: Generator, mw: *MarkdownWriter) !void {
@@ -424,6 +459,10 @@ const Generator = struct {
         );
         // Absolute paths here are necessary for resolving within the docs site.
         for (samples) |sample| {
+            if (!try self.sample_exists(sample)) {
+                continue;
+            }
+
             mw.print("* [{s}](/src/clients/{s}/samples/{s}/): {s}\n", .{
                 sample.proper_name,
                 language.directory,
@@ -443,9 +482,8 @@ const Generator = struct {
             \\ID and replica addresses are both chosen by the system that
             \\starts the TigerBeetle cluster.
             \\
-            \\Clients are thread-safe. But for better
-            \\performance, a single instance should be shared between
-            \\multiple concurrent tasks.
+            \\Clients are thread-safe and a single instance should be shared
+            \\between multiple concurrent tasks.
             \\
             \\Multiple clients are useful when connecting to more than
             \\one TigerBeetle cluster.
@@ -529,7 +567,7 @@ const Generator = struct {
         mw.paragraph(
             \\The response is an empty array if all transfers were created
             \\successfully. If the response is non-empty, each object in the
-            \\response array contains error information for an transfer that
+            \\response array contains error information for a transfer that
             \\failed. The error object contains an error code and the index of the
             \\transfer in the request batch.
             \\
@@ -553,7 +591,7 @@ const Generator = struct {
             \\potential. Instead, **always batch what you can**.
             \\
             \\The maximum batch size is set in the TigerBeetle server. The default
-            \\is 8191.
+            \\is 8190.
         );
         mw.code(language.markdown_name, language.batch_example);
 
@@ -620,6 +658,19 @@ const Generator = struct {
         );
         mw.code(language.markdown_name, language.lookup_transfers_example);
 
+        mw.header(2, "Get Account Transfers");
+        mw.paragraph(
+            \\NOTE: This is a preview API that is subject to breaking changes once we have
+            \\a stable querying API.
+            \\
+            \\Fetches the transfers involving a given account, allowing basic filter and pagination
+            \\capabilities.
+            \\
+            \\The transfers in the response are sorted by `timestamp` in chronological or
+            \\reverse-chronological order.
+        );
+        mw.code(language.markdown_name, language.get_account_transfers_example);
+
         mw.header(2, "Linked Events");
         mw.paragraph(
             \\When the `linked` flag is specified for an account when creating accounts or
@@ -641,12 +692,16 @@ const Generator = struct {
         mw.code(language.markdown_name, language.linked_events_example);
 
         mw.header(2, "Development Setup");
+        if (language.developer_setup_documentation.len > 0) {
+            mw.print("{s}\n\n", .{language.developer_setup_documentation});
+        }
+
         // Shell setup
         mw.header(3, "On Linux and macOS");
         mw.paragraph("In a POSIX shell run:");
         mw.commands(
             self.sprintf("{s}{s}", .{
-                \\git clone https://github.com/tigerbeetledb/tigerbeetle
+                \\git clone https://github.com/tigerbeetle/tigerbeetle
                 \\cd tigerbeetle
                 \\git submodule update --init --recursive
                 \\./scripts/install_zig.sh
@@ -662,7 +717,7 @@ const Generator = struct {
             mw.paragraph("In PowerShell run:");
             mw.commands(
                 self.sprintf("{s}{s}", .{
-                    \\git clone https://github.com/tigerbeetledb/tigerbeetle
+                    \\git clone https://github.com/tigerbeetle/tigerbeetle
                     \\cd tigerbeetle
                     \\git submodule update --init --recursive
                     \\.\scripts\install_zig.bat
@@ -675,7 +730,7 @@ const Generator = struct {
             mw.paragraph("Not yet supported.");
         }
 
-        const root = git_root(self.arena);
+        const root = try git_root(self.arena);
         try mw.save(self.sprintf("{s}/src/clients/{s}/README.md", .{ root, language.directory }));
     }
 
@@ -683,6 +738,10 @@ const Generator = struct {
         var language = self.language;
 
         for (samples) |sample| {
+            if (!try self.sample_exists(sample)) {
+                continue;
+            }
+
             mw.reset();
             mw.paragraph(
                 \\This file is generated by
@@ -693,6 +752,8 @@ const Generator = struct {
             var main_file_name = if (std.mem.eql(u8, language.directory, "go") or
                 std.mem.eql(u8, language.directory, "node"))
                 "main"
+            else if (std.mem.eql(u8, language.directory, "dotnet"))
+                "Program"
             else
                 "Main";
 
@@ -718,21 +779,15 @@ const Generator = struct {
             self.generate_language_setup_steps(
                 mw,
                 self.sprintf(
-                    "First, clone this repo and `cd` into `tigerbeetle/src/clients/{s}/samples/{s}`.",
-                    .{
-                        language.directory,
-                        sample.directory,
-                    },
-                ),
+                    \\First, clone this repo and `cd` into `tigerbeetle/src/clients/{s}/samples/{s}`.
+                , .{ language.directory, sample.directory }),
                 false,
             );
 
             mw.header(2, "Start the TigerBeetle server");
             mw.paragraph(
-                \\Follow steps in the repo README to start a **single
-                \\server** [from a single
-                \\binary](/README.md#single-binary) or [in a Docker
-                \\container](/README.md#with-docker).
+                \\Follow steps in the repo README to [run
+                \\TigerBeetle](/README.md#running-tigerbeetle).
                 \\
                 \\If you are not running on port `localhost:3000`, set
                 \\the environment variable `TB_ADDRESS` to the full
@@ -757,54 +812,47 @@ const Generator = struct {
     }
 };
 
+const CliArgs = struct {
+    language: ?[]const u8 = null,
+    validate: ?[]const u8 = null,
+    no_validate: bool = false,
+    no_generate: bool = false,
+    keep_tmp: bool = false,
+};
+
 pub fn main() !void {
-    var skipLanguage = [_]bool{false} ** languages.len;
-    var validate = true;
-    var generate = true;
-    var validateOnly: []const u8 = "";
+    var skip_language = [_]bool{false} ** languages.len;
 
     var global_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer global_arena.deinit();
 
-    var keepTmp = false;
+    var args = try std.process.argsWithAllocator(global_arena.allocator());
+    defer args.deinit();
 
-    var args = std.process.args();
-    _ = args.next(global_arena.allocator());
-    while (args.next(global_arena.allocator())) |arg_or_err| {
-        const arg = arg_or_err catch {
-            std.debug.print("Could not parse all arguments.\n", .{});
-            return error.CouldNotParseArguments;
-        };
+    assert(args.skip());
 
-        if (std.mem.eql(u8, arg, "--language")) {
-            var filter = try (args.next(global_arena.allocator()).?);
-            skipLanguage = [_]bool{true} ** languages.len;
-            for (languages) |language, i| {
-                if (std.mem.eql(u8, filter, language.directory)) {
-                    skipLanguage[i] = false;
+    const cli_args = flags.parse(&args, CliArgs);
+
+    if (cli_args.validate != null and cli_args.no_validate) {
+        flags.fatal("--validate: conflicts with --no-validate", .{});
+    }
+
+    if (cli_args.language) |filter| {
+        skip_language = .{true} ** languages.len;
+
+        var parts = std.mem.split(u8, filter, ",");
+        while (parts.next()) |part| {
+            for (languages, 0..) |language, i| {
+                if (std.mem.eql(u8, language.directory, part)) {
+                    skip_language[i] = false;
+                    break;
                 }
-            }
-        }
-
-        if (std.mem.eql(u8, arg, "--validate")) {
-            validateOnly = try (args.next(global_arena.allocator()).?);
-        }
-
-        if (std.mem.eql(u8, arg, "--no-validate")) {
-            validate = false;
-        }
-
-        if (std.mem.eql(u8, arg, "--no-generate")) {
-            generate = false;
-        }
-
-        if (std.mem.eql(u8, arg, "--keep-tmp")) {
-            keepTmp = true;
+            } else flags.fatal("--language: unknown language '{s}'", .{part});
         }
     }
 
-    for (languages) |language, i| {
-        if (skipLanguage[i]) {
+    for (languages, 0..) |language, i| {
+        if (skip_language[i]) {
             continue;
         }
 
@@ -816,36 +864,30 @@ pub fn main() !void {
         var mw = MarkdownWriter.init(&buf);
 
         var generator = try Generator.init(&arena, language);
-        if (validate) {
+        if (!cli_args.no_validate) {
             generator.print("Validating");
 
             for (Generator.tests) |t| {
-                var found = false;
-                if (validateOnly.len > 0) {
-                    var parts = std.mem.split(u8, validateOnly, ",");
-                    while (parts.next()) |name| {
-                        if (std.mem.eql(u8, name, t.name)) {
-                            found = true;
-                            break;
-                        }
-                    }
+                if (cli_args.validate) |validate_only| {
+                    var parts = std.mem.split(u8, validate_only, ",");
+
+                    const found = while (parts.next()) |name| {
+                        if (std.mem.eql(u8, name, t.name)) break true;
+                    } else false;
 
                     if (!found) {
-                        generator.printf(
-                            "Skipping test [{s}]",
-                            .{t.name},
-                        );
+                        generator.printf("Skipping test [{s}]", .{t.name});
                         continue;
                     }
                 }
 
                 const root = try git_root(&arena);
                 try std.os.chdir(root);
-                try t.validate(generator, keepTmp);
+                try t.validate(generator, cli_args.keep_tmp);
             }
         }
 
-        if (generate) {
+        if (!cli_args.no_generate) {
             generator.print("Generating main README");
             try generator.generate_main_readme(&mw);
 

@@ -2,10 +2,12 @@ const std = @import("std");
 const stdx = @import("./stdx.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 const mem = std.mem;
 
 const tb = @import("tigerbeetle.zig");
 const constants = @import("constants.zig");
+const schema = @import("lsm/schema.zig");
 const vsr = @import("vsr.zig");
 const Header = vsr.Header;
 
@@ -18,7 +20,6 @@ const StateMachineType = switch (state_machine) {
 
 const Client = @import("testing/cluster.zig").Client;
 const Cluster = @import("testing/cluster.zig").ClusterType(StateMachineType);
-const Replica = @import("testing/cluster.zig").Replica;
 const StateMachine = Cluster.StateMachine;
 const Failure = @import("testing/cluster.zig").Failure;
 const PartitionMode = @import("testing/packet_simulator.zig").PartitionMode;
@@ -28,21 +29,22 @@ const ReplySequence = @import("testing/reply_sequence.zig").ReplySequence;
 const IdPermutation = @import("testing/id.zig").IdPermutation;
 const Message = @import("message_pool.zig").MessagePool.Message;
 
-/// The `log` namespace in this root file is required to implement our custom `log` function.
 pub const output = std.log.scoped(.cluster);
+const log = std.log.scoped(.simulator);
 
-/// The -Dsimulator-log=<full|short> build option selects two logging modes.
-/// In "short" mode, only state transitions are printed (see `Cluster.log_replica`).
-/// "full" mode is the usual logging according to the level.
-pub const log_level: std.log.Level = if (vsr_simulator_options.log == .short) .info else .debug;
+pub const std_options = struct {
+    /// The -Dsimulator-log=<full|short> build option selects two logging modes.
+    /// In "short" mode, only state transitions are printed (see `Cluster.log_replica`).
+    /// "full" mode is the usual logging according to the level.
+    pub const log_level: std.log.Level = if (vsr_simulator_options.log == .short) .info else .debug;
+    pub const logFn = log_override;
+};
 
 // Uncomment if you need per-scope control over the log levels.
 // pub const scope_levels = [_]std.log.ScopeLevel{
 //     .{ .scope = .cluster, .level = .info },
 //     .{ .scope = .replica, .level = .debug },
 // };
-
-const log_simulator = std.log.scoped(.simulator);
 
 pub const tigerbeetle_config = @import("config.zig").configs.test_min;
 
@@ -55,16 +57,16 @@ pub fn main() !void {
     // TODO Use std.testing.allocator when all deinit() leaks are fixed.
     const allocator = std.heap.page_allocator;
 
-    var args = std.process.args();
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
 
     // Skip argv[0] which is the name of this executable:
-    _ = args_next(&args, allocator);
+    assert(args.skip());
 
     const seed_random = std.crypto.random.int(u64);
     const seed = seed_from_arg: {
-        const arg_two = args_next(&args, allocator) orelse break :seed_from_arg seed_random;
-        defer allocator.free(arg_two);
-        break :seed_from_arg parse_seed(arg_two);
+        const seed_argument = args.next() orelse break :seed_from_arg seed_random;
+        break :seed_from_arg parse_seed(seed_argument);
     };
 
     if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
@@ -77,7 +79,7 @@ pub fn main() !void {
             // If no seed is provided, than Debug is too slow and ReleaseSafe is much faster.
             @panic("no seed provided: the simulator must be run with -OReleaseSafe");
         }
-        if (log_level == .debug) {
+        if (vsr_simulator_options.log != .short) {
             output.warn("no seed provided: full debug logs are enabled, this will be slow", .{});
         }
     }
@@ -96,7 +98,7 @@ pub fn main() !void {
         .standby_count = standby_count,
         .client_count = client_count,
         .storage_size_limit = vsr.sector_floor(
-            constants.storage_size_max - random.uintLessThan(u64, constants.storage_size_max / 10),
+            constants.storage_size_limit_max - random.uintLessThan(u64, constants.storage_size_limit_max / 10),
         ),
         .seed = random.int(u64),
         .network = .{
@@ -134,17 +136,17 @@ pub fn main() !void {
             .faulty_wal_headers = replica_count > 1,
             .faulty_wal_prepares = replica_count > 1,
             .faulty_client_replies = replica_count > 1,
-            // TODO State sync: Enable faults when grid repair can fall back to state sync.
-            // (Without state sync it can get stuck.)
-            .faulty_grid = false,
+            // >2 instead of >1 because in R=2, a lagging replica may sync to the leading replica,
+            // but then the leading replica may have the only copy of a block in the cluster.
+            .faulty_grid = replica_count > 2,
         },
         .state_machine = switch (state_machine) {
             .testing => .{ .lsm_forest_node_count = 4096 },
             .accounting => .{
                 .lsm_forest_node_count = 4096,
-                .cache_entries_accounts = if (random.boolean()) 0 else 2048,
-                .cache_entries_transfers = 0,
-                .cache_entries_posted = if (random.boolean()) 0 else 2048,
+                .cache_entries_accounts = 2048,
+                .cache_entries_transfers = 2048,
+                .cache_entries_posted = 2048,
             },
         },
     };
@@ -242,7 +244,7 @@ pub fn main() !void {
     // Safety: replicas crash and restart; at any given point in time arbitrarily many replicas may
     // be crashed, but each replica restarts eventually. The cluster must process all requests
     // without split-brain.
-    const ticks_max_requests = 10_000_000;
+    const ticks_max_requests = 40_000_000;
     var tick_total: u64 = 0;
     var tick: u64 = 0;
     while (tick < ticks_max_requests) : (tick += 1) {
@@ -256,7 +258,10 @@ pub fn main() !void {
             break;
         }
     } else {
-        output.info("no liveness, final cluster state:", .{});
+        output.info(
+            "no liveness, final cluster state (requests_max={} requests_replied={}):",
+            .{ simulator.options.requests_max, simulator.requests_replied },
+        );
         simulator.cluster.log_cluster();
         output.err("you can reproduce this failure with seed={}", .{seed});
         fatal(.liveness, "unable to complete requests_committed_max before ticks_max", .{});
@@ -279,7 +284,7 @@ pub fn main() !void {
     if (simulator.done()) {
         const commits = simulator.cluster.state_checker.commits.items;
         const last_checksum = commits[commits.len - 1].header.checksum;
-        for (simulator.cluster.aofs) |*aof, replica_index| {
+        for (simulator.cluster.aofs, 0..) |*aof, replica_index| {
             if (simulator.core.isSet(replica_index)) {
                 try aof.validate(last_checksum);
             } else {
@@ -293,8 +298,12 @@ pub fn main() !void {
             output.warn("no liveness, core replicas cannot view-change", .{});
         } else if (simulator.core_missing_prepare()) |header| {
             output.warn("no liveness, op={} is not available in core", .{header.op});
+        } else if (try simulator.core_missing_blocks(allocator)) |blocks| {
+            output.warn("no liveness, {} blocks are not available in core", .{blocks});
+        } else if (simulator.core_missing_checkpoint()) {
+            output.warn("no liveness, core can't find canonical checkpoint", .{});
         } else {
-            output.info("no liveness, final cluster state (core={b})", .{simulator.core.mask});
+            output.info("no liveness, final cluster state (core={b}):", .{simulator.core.mask});
             simulator.cluster.log_cluster();
             output.err("you can reproduce this failure with seed={}", .{seed});
             fatal(.liveness, "no state convergence", .{});
@@ -363,7 +372,7 @@ pub const Simulator = struct {
 
         var replica_stability = try allocator.alloc(usize, options.cluster.replica_count + options.cluster.standby_count);
         errdefer allocator.free(replica_stability);
-        std.mem.set(usize, replica_stability, 0);
+        @memset(replica_stability, 0);
 
         var reply_sequence = try ReplySequence.init(allocator);
         errdefer reply_sequence.deinit(allocator);
@@ -403,6 +412,20 @@ pub const Simulator = struct {
 
         simulator.cluster.state_checker.assert_cluster_convergence();
 
+        // Check whether the replica is still repairing prepares/tables/replies.
+        for (simulator.cluster.replicas) |*replica| {
+            if (simulator.core.isSet(replica.replica)) {
+                for (replica.op_checkpoint() + 1..replica.op + 1) |op| {
+                    const header = replica.journal.header_with_op(op).?;
+                    if (!replica.journal.has_clean(header)) return false;
+                }
+                // It's okay for a replica to miss some prepares older than the current checkpoint.
+                maybe(replica.journal.faulty.count > 0);
+
+                if (!replica.sync_content_done()) return false;
+            }
+        }
+
         return true;
     }
 
@@ -421,13 +444,13 @@ pub const Simulator = struct {
             simulator.options.cluster.replica_count,
             simulator.options.cluster.standby_count,
         );
-        log_simulator.debug("transition_to_liveness_mode: core={b}", .{simulator.core.mask});
+        log.debug("transition_to_liveness_mode: core={b}", .{simulator.core.mask});
 
         var it = simulator.core.iterator(.{});
         while (it.next()) |replica_index| {
             const fault = false;
             if (simulator.cluster.replica_health[replica_index] == .down) {
-                simulator.restart_replica(@intCast(u8, replica_index), fault);
+                simulator.restart_replica(@as(u8, @intCast(replica_index)), fault);
             }
         }
 
@@ -440,6 +463,9 @@ pub const Simulator = struct {
     // the core might fail to converge, as parts of the repair protocol rely on primary-sent
     // `.start_view_change` messages. Until we fix this issue, we special-case this scenario in
     // VOPR and don't treat it as a liveness failure.
+    //
+    // TODO: make sure that .recovering_head replicas can transition to normal even without direct
+    // connection to the primary
     pub fn core_missing_primary(simulator: *const Simulator) bool {
         assert(simulator.core.count() > 0);
 
@@ -464,6 +490,9 @@ pub const Simulator = struct {
     /// The core contains at least a view-change quorum of replicas. But if one or more of those
     /// replicas are in status=recovering_head (due to corruption or state sync), then that may be
     /// insufficient.
+    /// TODO: State sync can trigger recovering_head without any crashes, and we should be able to
+    /// recover in that case.
+    /// (See https://github.com/tigerbeetle/tigerbeetle/pull/933#discussion_r1245440623)
     pub fn core_missing_quorum(simulator: *const Simulator) bool {
         assert(simulator.core.count() > 0);
 
@@ -472,7 +501,7 @@ pub const Simulator = struct {
         for (simulator.cluster.replicas) |*replica| {
             if (simulator.core.isSet(replica.replica) and !replica.standby()) {
                 core_replicas += 1;
-                core_recovering_head += @boolToInt(replica.status == .recovering_head);
+                core_recovering_head += @intFromBool(replica.status == .recovering_head);
             }
         }
 
@@ -487,14 +516,13 @@ pub const Simulator = struct {
     //
     // When generating a FaultAtlas, we don't try to protect core from excessive errors. Instead,
     // if the core gets stuck, we verify that this is indeed due to storage faults.
-    pub fn core_missing_prepare(simulator: *const Simulator) ?vsr.Header {
+    pub fn core_missing_prepare(simulator: *const Simulator) ?vsr.Header.Prepare {
         assert(simulator.core.count() > 0);
 
         var missing_op: ?u64 = null;
         for (simulator.cluster.replicas) |replica| {
             if (simulator.core.isSet(replica.replica)) {
                 assert(simulator.cluster.replica_health[replica.replica] == .up);
-                assert(replica.status == .normal);
                 if (replica.commit_min < replica.op) {
                     if (missing_op == null or missing_op.? > replica.commit_min + 1) {
                         missing_op = replica.commit_min + 1;
@@ -520,14 +548,156 @@ pub const Simulator = struct {
         return missing_header;
     }
 
+    /// Check whether the cluster is stuck because the entire core is missing the same block[s].
+    pub fn core_missing_blocks(
+        simulator: *const Simulator,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!?usize {
+        assert(simulator.core.count() > 0);
+
+        var blocks_missing = std.ArrayList(struct {
+            replica: u8,
+            address: u64,
+            checksum: u128,
+        }).init(allocator);
+        defer blocks_missing.deinit();
+
+        // Find all blocks that any replica in the core is missing.
+        for (simulator.cluster.replicas) |replica| {
+            if (!simulator.core.isSet(replica.replica)) continue;
+
+            const storage = &simulator.cluster.storages[replica.replica];
+            var fault_iterator = replica.grid.read_global_queue.peek();
+            while (fault_iterator) |faulty_read| : (fault_iterator = faulty_read.next) {
+                try blocks_missing.append(.{
+                    .replica = replica.replica,
+                    .address = faulty_read.address,
+                    .checksum = faulty_read.checksum,
+                });
+
+                log.debug("{}: core_missing_blocks: " ++
+                    "missing address={} checksum={} corrupt={} (remote read)", .{
+                    replica.replica,
+                    faulty_read.address,
+                    faulty_read.checksum,
+                    storage.area_faulty(.{ .grid = .{ .address = faulty_read.address } }),
+                });
+            }
+
+            var repair_iterator = replica.grid.blocks_missing.faulty_blocks.iterator();
+            while (repair_iterator.next()) |fault| {
+                try blocks_missing.append(.{
+                    .replica = replica.replica,
+                    .address = fault.key_ptr.*,
+                    .checksum = fault.value_ptr.checksum,
+                });
+
+                log.debug("{}: core_missing_blocks: " ++
+                    "missing address={} checksum={} corrupt={} (GridBlocksMissing)", .{
+                    replica.replica,
+                    fault.key_ptr.*,
+                    fault.value_ptr.checksum,
+                    storage.area_faulty(.{ .grid = .{ .address = fault.key_ptr.* } }),
+                });
+            }
+        }
+
+        // Check whether every replica in the core is missing the blocks.
+        // (If any core replica has the block, then that is a bug, since it should have repaired.)
+        for (blocks_missing.items) |block_missing| {
+            for (simulator.cluster.replicas) |replica| {
+                const storage = &simulator.cluster.storages[replica.replica];
+
+                // A replica might actually have the block that it is requesting, but not know.
+                // This can occur after state sync: if we compact and create a table, but then skip
+                // over that table via state sync, we will try to sync the table anyway.
+                if (replica.replica == block_missing.replica) continue;
+
+                if (!simulator.core.isSet(replica.replica)) continue;
+                if (replica.standby()) continue;
+                if (storage.area_faulty(.{
+                    .grid = .{ .address = block_missing.address },
+                })) continue;
+
+                const block = storage.grid_block(block_missing.address) orelse continue;
+                const block_header = schema.header_from_block(block);
+                if (block_header.checksum == block_missing.checksum) {
+                    log.err("{}: core_missing_blocks: found address={} checksum={}", .{
+                        replica.replica,
+                        block_missing.address,
+                        block_missing.checksum,
+                    });
+                    @panic("block found in core");
+                }
+            }
+        }
+
+        if (blocks_missing.items.len == 0) {
+            return null;
+        } else {
+            return blocks_missing.items.len;
+        }
+    }
+
+    // Check if the core is stuck because replicas can't converge to a canonical checkpoint. This
+    // can happen in two scenarios:
+    //
+    // A) There is no canonical checkpoint at all --- one replica is ahead of others by a
+    //    checkpoint, but there are no commits on top of that checkpoint.
+    // B) During view change, there is a canonical checkpoint, but replicas can't learn that it is
+    //    in fact canonical, because commit messages don't flow, so commit_max is not advanced,
+    //    and there are not enough replicas at a checkpoint for the quorum condition.
+    //
+    // TODO: both of the above genuine liveness issues to be fixed with async checkpoints, which
+    // would allow to sync to the _previous_ checkpoint, guaranteed to be canonical.
+    fn core_missing_checkpoint(simulator: *const Simulator) bool {
+        var core_replicas_total: u8 = 0;
+        var core_replicas_normal: u8 = 0;
+        var commit_max: u64 = 0;
+        var checkpoint_max: u64 = 0;
+        var core_checkpoints = stdx.BoundedArray(u128, constants.replicas_max){};
+        for (simulator.cluster.replicas) |replica| {
+            if (!simulator.core.isSet(replica.replica)) continue;
+            if (replica.standby()) continue;
+            core_replicas_total += 1;
+            core_replicas_normal += @intFromBool(replica.status == .normal);
+            commit_max = @max(commit_max, replica.commit_max);
+            checkpoint_max = @max(
+                checkpoint_max,
+                replica.superblock.working.vsr_state.checkpoint.commit_min,
+            );
+            core_checkpoints.append_assume_capacity(replica.superblock.working.checkpoint_id());
+        }
+
+        assert(core_replicas_normal == core_replicas_total or core_replicas_normal == 0);
+
+        for (0..core_checkpoints.count()) |i| {
+            for (0..i) |j| {
+                if (core_checkpoints.get(i) != core_checkpoints.get(j)) {
+                    if (core_replicas_normal == core_replicas_total) {
+                        // Case A) all replicas are normal, but commit_max is exactly checkpoint
+                        // trigger.
+                        return vsr.Checkpoint.trigger_for_checkpoint(checkpoint_max) == commit_max;
+                    } else {
+                        // Case B) all replicas are in a view change or recovering head, they
+                        // can't learn which checkpoint is canonical without commit messages.
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
     fn on_cluster_reply(
         cluster: *Cluster,
         reply_client: usize,
-        request: *Message,
-        reply: *Message,
+        request: *Message.Request,
+        reply: *Message.Reply,
     ) void {
         // TODO(Zig) Use @returnAddress to initialzie the cluster, then this can just use @fieldParentPtr().
-        const simulator = @ptrCast(*Simulator, @alignCast(@alignOf(Simulator), cluster.context.?));
+        const simulator: *Simulator = @ptrCast(@alignCast(cluster.context.?));
         simulator.reply_sequence.insert(reply_client, request, reply);
 
         while (simulator.reply_sequence.peek()) |commit| {
@@ -544,14 +714,14 @@ pub const Simulator = struct {
             assert(commit.request.header.command == .request);
             assert(commit.request.header.client == commit_client.id);
 
-            log_simulator.debug("consume_stalled_replies: op={} operation={} client={} request={}", .{
+            log.debug("consume_stalled_replies: op={} operation={} client={} request={}", .{
                 commit.reply.header.op,
                 commit.reply.header.operation,
                 commit.request.header.client,
                 commit.request.header.request,
             });
 
-            if (!commit.request.header.operation.reserved()) {
+            if (!commit.request.header.operation.vsr_reserved()) {
                 simulator.requests_replied += 1;
                 simulator.workload.on_reply(
                     commit.client_index,
@@ -584,32 +754,27 @@ pub const Simulator = struct {
             simulator.random.uintLessThan(usize, simulator.options.cluster.client_count);
         var client = &simulator.cluster.clients[client_index];
 
-        // Make sure that there is capacity in the client's request queue so that we never trigger
-        // error.TooManyOutstandingRequests.
-        if (client.request_queue.count + 1 > constants.client_request_queue_max) return;
-
         // Messages aren't added to the ReplySequence until a reply arrives.
         // Before sending a new message, make sure there will definitely be room for it.
         var reserved: usize = 0;
         for (simulator.cluster.clients) |*c| {
             // Count the number of clients that are still waiting for a `register` to complete,
             // since they may start one at any time.
-            reserved += @boolToInt(c.session == 0);
+            reserved += @intFromBool(c.session == 0);
             // Count the number of requests queued.
             reserved += c.request_queue.count;
         }
         // +1 for the potential request — is there room in the sequencer's queue?
         if (reserved + 1 > simulator.reply_sequence.free()) return;
 
-        var request_message = client.get_message();
-        defer client.unref(request_message);
+        // Make sure that there is capacity in the client's request queue.
+        if (client.messages_available == 0) return;
+        const request_message = client.get_message();
+        errdefer client.release(request_message);
 
         const request_metadata = simulator.workload.build_request(
             client_index,
-            @alignCast(
-                @alignOf(vsr.Header),
-                request_message.buffer[@sizeOf(vsr.Header)..constants.message_size_max],
-            ),
+            request_message.buffer[@sizeOf(vsr.Header)..constants.message_size_max],
         );
         assert(request_metadata.size <= constants.message_size_max - @sizeOf(vsr.Header));
 
@@ -621,9 +786,10 @@ pub const Simulator = struct {
         );
         // Since we already checked the client's request queue for free space, `client.request()`
         // should always queue the request.
-        assert(request_message == client.request_queue.tail_ptr().?.message);
+        assert(request_message == client.request_queue.tail_ptr().?.message.base());
         assert(request_message.header.size == @sizeOf(vsr.Header) + request_metadata.size);
-        assert(request_message.header.operation.cast(StateMachine) == request_metadata.operation);
+        assert(request_message.header.into(.request).?.operation.cast(StateMachine) ==
+            request_metadata.operation);
 
         simulator.requests_sent += 1;
         assert(simulator.requests_sent <= simulator.options.requests_max);
@@ -632,11 +798,13 @@ pub const Simulator = struct {
     fn tick_crash(simulator: *Simulator) void {
         const recoverable_count_min =
             vsr.quorums(simulator.options.cluster.replica_count).view_change;
+
         var recoverable_count: usize = 0;
-        for (simulator.cluster.replicas) |*replica, i| {
-            recoverable_count += @boolToInt(simulator.cluster.replica_health[i] == .up and
+        for (simulator.cluster.replicas, 0..) |*replica, i| {
+            recoverable_count += @intFromBool(simulator.cluster.replica_health[i] == .up and
+                !replica.standby() and
                 replica.status != .recovering_head and
-                !replica.standby());
+                replica.syncing == .idle);
         }
 
         for (simulator.cluster.replicas) |*replica| {
@@ -652,10 +820,11 @@ pub const Simulator = struct {
                         @as(f64, if (replica_writes == 0) 1.0 else 10.0);
                     if (!chance_f64(simulator.random, crash_probability)) continue;
 
-                    recoverable_count -=
-                        @boolToInt(replica.status != .recovering_head and !replica.standby());
+                    recoverable_count -= @intFromBool(!replica.standby() and
+                        replica.status != .recovering_head and
+                        replica.syncing == .idle);
 
-                    log_simulator.debug("{}: crash replica", .{replica.replica});
+                    log.debug("{}: crash replica", .{replica.replica});
                     simulator.cluster.crash_replica(replica.replica);
 
                     simulator.replica_stability[replica.replica] =
@@ -669,7 +838,7 @@ pub const Simulator = struct {
                         continue;
                     }
 
-                    const fault = recoverable_count > recoverable_count_min or replica.standby();
+                    const fault = recoverable_count >= recoverable_count_min or replica.standby();
                     simulator.restart_replica(replica.replica, fault);
                 },
             }
@@ -687,23 +856,34 @@ pub const Simulator = struct {
             // be disabled by `storage.faulty`, we must manually repair it here to
             // ensure a cluster cannot become stuck in status=recovering_head.
             // See recover_slots() for more detail.
-            const offset = vsr.Zone.wal_headers.offset(0);
-            const size = vsr.Zone.wal_headers.size().?;
-            const headers_bytes = replica_storage.memory[offset..][0..size];
-            const headers = mem.bytesAsSlice(vsr.Header, headers_bytes);
-            for (headers) |*h, slot| {
-                if (h.checksum == 0) h.* = replica_storage.wal_prepares()[slot].header;
+            const headers_offset = vsr.Zone.wal_headers.offset(0);
+            const headers_size = vsr.Zone.wal_headers.size().?;
+            const headers_bytes = replica_storage.memory[headers_offset..][0..headers_size];
+            for (
+                mem.bytesAsSlice(vsr.Header.Prepare, headers_bytes),
+                replica_storage.wal_prepares(),
+            ) |*wal_header, *wal_prepare| {
+                if (wal_header.checksum == 0) {
+                    wal_header.* = wal_prepare.header;
+                }
             }
         }
 
-        log_simulator.debug("{}: restart replica (faults={})", .{
+        log.debug("{}: restart replica (faults={})", .{
             replica_index,
             fault,
         });
 
         replica_storage.faulty = fault;
         simulator.cluster.restart_replica(replica_index) catch unreachable;
-        assert(simulator.cluster.replicas[replica_index].status != .recovering_head or fault);
+
+        const replica: *const Cluster.Replica = &simulator.cluster.replicas[replica_index];
+        if (replica.status == .recovering_head) {
+            // Even with faults disabled, a replica that was syncing before it crashed
+            // (or just recently finished syncing before it crashed) may wind up in
+            // status=recovering_head.
+            assert(fault or replica.op < replica.op_checkpoint());
+        }
 
         replica_storage.faulty = true;
         simulator.replica_stability[replica_index] =
@@ -714,7 +894,7 @@ pub const Simulator = struct {
 /// Print an error message and then exit with an exit code.
 fn fatal(failure: Failure, comptime fmt_string: []const u8, args: anytype) noreturn {
     output.err(fmt_string, args);
-    std.os.exit(@enumToInt(failure));
+    std.os.exit(@intFromEnum(failure));
 }
 
 /// Returns true, `p` percent of the time, else false.
@@ -729,23 +909,17 @@ fn chance_f64(random: std.rand.Random, p: f64) bool {
     return random.float(f64) * 100.0 < p;
 }
 
-/// Returns the next argument for the simulator or null (if none available)
-fn args_next(args: *std.process.ArgIterator, allocator: std.mem.Allocator) ?[:0]const u8 {
-    const err_or_bytes = args.next(allocator) orelse return null;
-    return err_or_bytes catch @panic("Unable to extract next value from args");
-}
-
 /// Returns a random partitioning mode.
 fn random_partition_mode(random: std.rand.Random) PartitionMode {
     const typeInfo = @typeInfo(PartitionMode).Enum;
     var enumAsInt = random.uintAtMost(typeInfo.tag_type, typeInfo.fields.len - 1);
-    return @intToEnum(PartitionMode, enumAsInt);
+    return @as(PartitionMode, @enumFromInt(enumAsInt));
 }
 
 fn random_partition_symmetry(random: std.rand.Random) PartitionSymmetry {
     const typeInfo = @typeInfo(PartitionSymmetry).Enum;
     var enumAsInt = random.uintAtMost(typeInfo.tag_type, typeInfo.fields.len - 1);
-    return @intToEnum(PartitionSymmetry, enumAsInt);
+    return @as(PartitionSymmetry, @enumFromInt(enumAsInt));
 }
 
 /// Returns a random fully-connected subgraph which includes at least view change
@@ -789,6 +963,19 @@ fn random_core(random: std.rand.Random, replica_count: u8, standby_count: u8) Co
 }
 
 pub fn parse_seed(bytes: []const u8) u64 {
+    if (bytes.len == 40) {
+        // Normally, a seed is specified as a base-10 integer. However, as a special case, we allow
+        // using a Git hash (a hex string 40 character long). This is used by our CI, which passes
+        // current commit hash as a seed --- that way, we run simulator on CI, we run it with
+        // different, "random" seeds, but the the failures remain reproducible just from the commit
+        // hash!
+        const commit_hash = std.fmt.parseUnsigned(u160, bytes, 16) catch |err| switch (err) {
+            error.Overflow => unreachable,
+            error.InvalidCharacter => @panic("commit hash seed contains an invalid character"),
+        };
+        return @truncate(commit_hash);
+    }
+
     return std.fmt.parseUnsigned(u64, bytes, 10) catch |err| switch (err) {
         error.Overflow => @panic("seed exceeds a 64-bit unsigned integer"),
         error.InvalidCharacter => @panic("seed contains an invalid character"),
@@ -800,7 +987,7 @@ var log_buffer: std.io.BufferedWriter(4096, std.fs.File.Writer) = .{
     .unbuffered_writer = undefined,
 };
 
-pub fn log(
+fn log_override(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.EnumLiteral),
     comptime format: []const u8,

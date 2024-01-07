@@ -4,7 +4,7 @@ const math = std.math;
 
 const log = std.log.scoped(.packet_simulator);
 const vsr = @import("../vsr.zig");
-const PriorityQueue = @import("./priority_queue.zig").PriorityQueue;
+const PriorityQueue = std.PriorityQueue;
 const fuzz = @import("./fuzz.zig");
 
 pub const PacketSimulatorOptions = struct {
@@ -82,12 +82,12 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
 
         const LinkPacket = struct {
             expiry: u64,
-            callback: fn (packet: Packet, path: Path) void,
+            callback: *const fn (packet: Packet, path: Path) void,
             packet: Packet,
         };
 
         const Link = struct {
-            queue: PriorityQueue(LinkPacket, void, Self.order_packets),
+            queue: PriorityQueue(LinkPacket, void, order_packets),
             /// Commands in the set are delivered.
             /// Commands not in the set are dropped.
             filter: LinkFilter = LinkFilter.initFull(),
@@ -98,7 +98,7 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
         };
 
         const RecordedPacket = struct {
-            callback: fn (packet: Packet, path: Path) void,
+            callback: *const fn (packet: Packet, path: Path) void,
             packet: Packet,
             path: Path,
         };
@@ -130,11 +130,11 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
             const links = try allocator.alloc(Link, @as(usize, process_count_) * process_count_);
             errdefer allocator.free(links);
 
-            for (links) |*link, i| {
+            for (links, 0..) |*link, i| {
                 errdefer for (links[0..i]) |l| l.queue.deinit();
 
-                const queue = PriorityQueue(LinkPacket, void, Self.order_packets).init(allocator, {});
-                try link.queue.ensureTotalCapacity(options.path_maximum_capacity);
+                var queue = PriorityQueue(LinkPacket, void, order_packets).init(allocator, {});
+                try queue.ensureTotalCapacity(options.path_maximum_capacity);
                 link.* = .{ .queue = queue };
             }
             errdefer for (links) |link| link.queue.deinit();
@@ -144,11 +144,11 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
 
             const auto_partition = try allocator.alloc(bool, @as(usize, options.node_count));
             errdefer allocator.free(auto_partition);
-            std.mem.set(bool, auto_partition, false);
+            @memset(auto_partition, false);
 
             const auto_partition_nodes = try allocator.alloc(u8, @as(usize, options.node_count));
             errdefer allocator.free(auto_partition_nodes);
-            for (auto_partition_nodes) |*node, i| node.* = @intCast(u8, i);
+            for (auto_partition_nodes, 0..) |*node, i| node.* = @as(u8, @intCast(i));
 
             return Self{
                 .options = options,
@@ -269,13 +269,13 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
             const random = self.prng.random();
             var partition = self.auto_partition;
             switch (self.options.partition_mode) {
-                .none => std.mem.set(bool, partition, false),
+                .none => @memset(partition, false),
                 .uniform_size => {
                     // Exclude cases partition_size == 0 and partition_size == node_count
                     const partition_size =
                         1 + random.uintAtMost(u8, self.options.node_count - 2);
                     random.shuffle(u8, self.auto_partition_nodes);
-                    for (self.auto_partition_nodes) |r, i| {
+                    for (self.auto_partition_nodes, 0..) |r, i| {
                         partition[r] = i < partition_size;
                     }
                 },
@@ -296,7 +296,7 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
                     }
                 },
                 .isolate_single => {
-                    std.mem.set(bool, partition, false);
+                    @memset(partition, false);
                     const n = random.uintLessThan(u8, self.options.node_count);
                     partition[n] = true;
                 },
@@ -333,14 +333,14 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
                     if (self.should_unpartition()) {
                         self.auto_partition_active = false;
                         self.auto_partition_stability = self.options.unpartition_stability;
-                        std.mem.set(bool, self.auto_partition, false);
+                        @memset(self.auto_partition, false);
                         for (self.links) |*link| link.filter = LinkFilter.initFull();
-                        log.warn("unpartitioned network: partition={d}", .{self.auto_partition});
+                        log.warn("unpartitioned network: partition={any}", .{self.auto_partition});
                     }
                 } else {
                     if (self.options.node_count > 1 and self.should_partition()) {
                         self.auto_partition_network();
-                        log.warn("partitioned network: partition={d}", .{self.auto_partition});
+                        log.warn("partitioned network: partition={any}", .{self.auto_partition});
                     }
                 }
             }
@@ -395,7 +395,7 @@ pub fn PacketSimulatorType(comptime Packet: type) type {
         pub fn submit_packet(
             self: *Self,
             packet: Packet, // Callee owned.
-            callback: fn (packet: Packet, path: Path) void,
+            callback: *const fn (packet: Packet, path: Path) void,
             path: Path,
         ) void {
             const queue = &self.links[self.path_index(path)].queue;

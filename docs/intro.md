@@ -13,10 +13,11 @@ for mission critical safety and performance.
 First, get TigerBeetle running:
 
 * [Run a single-node cluster with a single binary](./quick-start/single-binary.md)
+* Or [run a three-node cluster with a single binary](./quick-start/single-binary-three.md)
 * Or [run a single-node cluster with Docker](./quick-start/with-docker.md)
 * Or [run a three-node cluster with docker-compose](./quick-start/with-docker-compose.md)
 
-Then, try creating accounts and transfers [using Node.js as a CLI](./quick-start/node-cli.md).
+Then, try creating accounts and transfers [using the TigerBeetle CLI client](./quick-start/cli-client.md).
 
 ## Designing for TigerBeetle
 
@@ -65,18 +66,18 @@ To understand TigerBeetle's data model, see:
 
 ## Contributing
 
-* [Watch our talks, listen to our podcasts](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/TALKS.md)
-* [Read HISTORY.md](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/HISTORY.md)
-* [Read DESIGN.md](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/DESIGN.md)
-* [Read DEEP_DIVE.md](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/DEEP_DIVE.md)
-* [Read TIGER_STYLE.md](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
-* [Read HACKING.md](https://github.com/tigerbeetledb/tigerbeetle/blob/main/docs/HACKING.md)
-* And explore internal READMEs within the [TigerBeetle src directory](https://github.com/tigerbeetledb/tigerbeetle/tree/main/src)
+* [Watch our talks, listen to our podcasts](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TALKS.md)
+* [Read HISTORY.md](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/HISTORY.md)
+* [Read DESIGN.md](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/DESIGN.md)
+* [Read DEEP_DIVE.md](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/DEEP_DIVE.md)
+* [Read TIGER_STYLE.md](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
+* [Read HACKING.md](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/HACKING.md)
+* And explore internal READMEs within the [TigerBeetle src directory](https://github.com/tigerbeetle/tigerbeetle/tree/main/src)
 
 ## Community
 
 * [Twitter](https://twitter.com/tigerbeetledb)
-* [GitHub](https://github.com/tigerbeetledb/tigerbeetle)
+* [GitHub](https://github.com/tigerbeetle/tigerbeetle)
 * [Slack](https://join.slack.com/t/tigerbeetle/shared_invite/zt-1gf3qnvkz-GwkosudMCM3KGbGiSu87RQ)
 * [Monthly Newsletter](https://mailchi.mp/8e9fa0f36056/subscribe-to-tigerbeetle)
 * [YouTube](https://www.youtube.com/@tigerbeetledb)

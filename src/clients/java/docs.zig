@@ -38,7 +38,7 @@ fn find_tigerbeetle_client_jar(arena: *std.heap.ArenaAllocator, root: []const u8
         }
     }
 
-    var dir = try std.fs.cwd().openDir(java_target_path, .{ .iterate = true });
+    var dir = try std.fs.cwd().openIterableDir(java_target_path, .{});
     defer dir.close();
 
     var walker = try dir.walk(arena.allocator());
@@ -122,12 +122,10 @@ pub const JavaDocs = Docs{
     .extension = "java",
     .proper_name = "Java",
 
-    .test_linux_docker_image = "alpine",
-
     .test_source_path = "src/main/java/",
 
     .name = "tigerbeetle-java",
-    .description = 
+    .description =
     \\The TigerBeetle client for Java.
     \\
     \\[![javadoc](https://javadoc.io/badge2/com.tigerbeetle/tigerbeetle-java/javadoc.svg)](https://javadoc.io/doc/com.tigerbeetle/tigerbeetle-java)
@@ -135,13 +133,13 @@ pub const JavaDocs = Docs{
     \\[![maven-central](https://img.shields.io/maven-central/v/com.tigerbeetle/tigerbeetle-java)](https://central.sonatype.com/namespace/com.tigerbeetle)
     ,
 
-    .prerequisites = 
+    .prerequisites =
     \\* Java >= 11
     \\* Maven >= 3.6 (not strictly necessary but it's what our guides assume)
     ,
 
     .project_file_name = "pom.xml",
-    .project_file = 
+    .project_file =
     \\<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     \\         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     \\  <modelVersion>4.0.0</modelVersion>
@@ -187,12 +185,12 @@ pub const JavaDocs = Docs{
     \\      <version>0.0.1-3431</version>
     \\    </dependency>
     \\  </dependencies>
-    \\</project> 
+    \\</project>
     ,
 
     .test_file_name = "Main",
 
-    .install_sample_file = 
+    .install_sample_file =
     \\package com.tigerbeetle.samples;
     \\
     \\import com.tigerbeetle.*;
@@ -221,15 +219,17 @@ pub const JavaDocs = Docs{
 
     .examples = "",
 
-    .client_object_example = 
-    \\var tbAddress = System.getenv("TB_ADDRESS");
+    .client_object_example =
+    \\var replicaAddress = System.getenv("TB_ADDRESS");
+    \\byte[] clusterID = UInt128.asBytes(0);
+    \\String[] replicaAddresses = new String[] {replicaAddress == null ? "3000" : replicaAddress};
     \\Client client = new Client(
-    \\  0,
-    \\  new String[] {tbAddress.length() > 0 ? tbAddress : "3000"}
+    \\  clusterID,
+    \\  replicaAddresses
     \\);
     ,
 
-    .client_object_documentation = 
+    .client_object_documentation =
     \\If you create a `Client` like this, don't forget to call
     \\`client.close()` when you are done with it. Otherwise you
     \\can use the
@@ -238,17 +238,17 @@ pub const JavaDocs = Docs{
     \\```java
     \\try (var client = new Client(...)) {
     \\  // Use client
-    \\} catch (Exception e) {
-    \\  // Handle exception
     \\}
     \\```
     ,
 
-    .create_accounts_example = 
+    .create_accounts_example =
     \\AccountBatch accounts = new AccountBatch(1);
     \\accounts.add();
     \\accounts.setId(137);
-    \\accounts.setUserData(UInt128.asBytes(new java.math.BigInteger("92233720368547758070")));
+    \\accounts.setUserData128(UInt128.asBytes(java.util.UUID.randomUUID()));
+    \\accounts.setUserData64(1234567890);
+    \\accounts.setUserData32(42);
     \\accounts.setLedger(1);
     \\accounts.setCode(718);
     \\accounts.setFlags(0);
@@ -256,18 +256,21 @@ pub const JavaDocs = Docs{
     \\CreateAccountResultBatch accountErrors = client.createAccounts(accounts);
     ,
 
-    .create_accounts_documentation = 
-    \\The 128-bit fields like `id` and `user_data` have a few
+    .create_accounts_documentation =
+    \\The 128-bit fields like `id` and `user_data_128` have a few
     \\overrides to make it easier to integrate. You can either
     \\pass in a long, a pair of longs (least and most
     \\significant bits), or a `byte[]`.
     \\
     \\There is also a `com.tigerbeetle.UInt128` helper with static
     \\methods for converting 128-bit little-endian unsigned integers
-    \\between instances of `long`, `UUID`, `BigInteger` and `byte[]`.
+    \\between instances of `long`, `java.util.UUID`, `java.math.BigInteger` and `byte[]`.
+    \\
+    \\The fields for transfer amounts and account balances are also 128-bit,
+    \\but they are always represented as a `java.math.BigInteger`.
     ,
 
-    .account_flags_documentation = 
+    .account_flags_documentation =
     \\To toggle behavior for an account, combine enum values stored in the
     \\`AccountFlags` object with bitwise-or:
     \\
@@ -276,7 +279,7 @@ pub const JavaDocs = Docs{
     \\* `AccountFlags.CREDITS_MUST_NOT_EXCEED_CREDITS`
     ,
 
-    .account_flags_example = 
+    .account_flags_example =
     \\accounts = new AccountBatch(3);
     \\
     \\// First account
@@ -291,7 +294,7 @@ pub const JavaDocs = Docs{
     \\accountErrors = client.createAccounts(accounts);
     ,
 
-    .create_accounts_errors_example = 
+    .create_accounts_errors_example =
     \\accounts = new AccountBatch(3);
     \\
     \\// First account
@@ -311,7 +314,7 @@ pub const JavaDocs = Docs{
     \\    switch (accountErrors.getResult()) {
     \\        case Exists:
     \\            System.err.printf("Account at %d already exists.\n",
-    \\                accountErrors.getIndex());        
+    \\                accountErrors.getIndex());
     \\            break;
     \\
     \\        default:
@@ -325,37 +328,39 @@ pub const JavaDocs = Docs{
 
     .create_accounts_errors_documentation = "",
 
-    .lookup_accounts_example = 
+    .lookup_accounts_example =
     \\IdBatch ids = new IdBatch(2);
     \\ids.add(137);
     \\ids.add(138);
     \\accounts = client.lookupAccounts(ids);
     ,
 
-    .create_transfers_example = 
+    .create_transfers_example =
     \\TransferBatch transfers = new TransferBatch(1);
     \\transfers.add();
     \\transfers.setId(1);
     \\transfers.setDebitAccountId(1);
     \\transfers.setCreditAccountId(2);
-    \\transfers.setUserData(2);
+    \\transfers.setAmount(10);
+    \\transfers.setUserData128(UInt128.asBytes(java.util.UUID.randomUUID()));
+    \\transfers.setUserData64(1234567890);
+    \\transfers.setUserData32(42);
     \\transfers.setTimeout(0);
     \\transfers.setLedger(1);
     \\transfers.setCode(1);
     \\transfers.setFlags(0);
-    \\transfers.setAmount(10);
     \\
     \\CreateTransferResultBatch transferErrors = client.createTransfers(transfers);
     ,
 
     .create_transfers_documentation = "",
 
-    .create_transfers_errors_example = 
+    .create_transfers_errors_example =
     \\while (transferErrors.next()) {
     \\    switch (transferErrors.getResult()) {
     \\        case ExceedsCredits:
     \\            System.err.printf("Transfer at %d exceeds credits.\n",
-    \\                transferErrors.getIndex());        
+    \\                transferErrors.getIndex());
     \\            break;
     \\
     \\        default:
@@ -369,29 +374,35 @@ pub const JavaDocs = Docs{
 
     .create_transfers_errors_documentation = "",
 
-    .no_batch_example = 
-    \\for (int i = 0; i < transfers.length; i++) {
+    .no_batch_example =
+    \\var transferIds = new long[]{100, 101, 102};
+    \\var debitIds = new long[]{1, 2, 3};
+    \\var creditIds = new long[]{4, 5, 6};
+    \\var amounts = new long[]{1000, 29, 11};
+    \\for (int i = 0; i < transferIds.length; i++) {
     \\  TransferBatch batch = new TransferBatch(1);
     \\  batch.add();
-    \\  batch.setId(transfers[i].getId());
-    \\  batch.setDebitAccountId(transfers[i].getDebitAccountId());
-    \\  batch.setCreditAccountId(transfers[i].getCreditAccountId());
+    \\  batch.setId(transferIds[i]);
+    \\  batch.setDebitAccountId(debitIds[i]);
+    \\  batch.setCreditAccountId(creditIds[i]);
+    \\  batch.setAmount(amounts[i]);
     \\
     \\  CreateTransferResultBatch errors = client.createTransfers(batch);
     \\  // error handling omitted
     \\}
     ,
 
-    .batch_example = 
-    \\var BATCH_SIZE = 8191;
-    \\for (int i = 0; i < transfers.length; i += BATCH_SIZE) {
+    .batch_example =
+    \\var BATCH_SIZE = 8190;
+    \\for (int i = 0; i < transferIds.length; i += BATCH_SIZE) {
     \\  TransferBatch batch = new TransferBatch(BATCH_SIZE);
     \\
-    \\  for (int j = 0; j < BATCH_SIZE && i + j < transfers.length; j++) {
+    \\  for (int j = 0; j < BATCH_SIZE && i + j < transferIds.length; j++) {
     \\    batch.add();
-    \\    batch.setId(transfers[i + j].getId());
-    \\    batch.setDebitAccountId(transfers[i + j].getDebitAccountId());
-    \\    batch.setCreditAccountId(transfers[i + j].getCreditAccountId());
+    \\    batch.setId(transferIds[i+j]);
+    \\    batch.setDebitAccountId(debitIds[i+j]);
+    \\    batch.setCreditAccountId(creditIds[i+j]);
+    \\    batch.setAmount(amounts[i+j]);
     \\  }
     \\
     \\  CreateTransferResultBatch errors = client.createTransfers(batch);
@@ -399,7 +410,7 @@ pub const JavaDocs = Docs{
     \\}
     ,
 
-    .transfer_flags_documentation = 
+    .transfer_flags_documentation =
     \\To toggle behavior for an account, combine enum values stored in the
     \\`TransferFlags` object with bitwise-or:
     \\
@@ -410,7 +421,7 @@ pub const JavaDocs = Docs{
     \\* `TransferFlags.VOID_PENDING_TRANSFER`
     ,
 
-    .transfer_flags_link_example = 
+    .transfer_flags_link_example =
     \\transfers = new TransferBatch(2);
     \\
     \\// First transfer
@@ -424,7 +435,7 @@ pub const JavaDocs = Docs{
     \\transferErrors = client.createTransfers(transfers);
     ,
 
-    .transfer_flags_post_example = 
+    .transfer_flags_post_example =
     \\transfers = new TransferBatch(1);
     \\
     \\// First transfer
@@ -434,7 +445,7 @@ pub const JavaDocs = Docs{
     \\transferErrors = client.createTransfers(transfers);
     ,
 
-    .transfer_flags_void_example = 
+    .transfer_flags_void_example =
     \\transfers = new TransferBatch(1);
     \\
     \\// First transfer
@@ -444,14 +455,25 @@ pub const JavaDocs = Docs{
     \\transferErrors = client.createTransfers(transfers);
     ,
 
-    .lookup_transfers_example = 
+    .lookup_transfers_example =
     \\ids = new IdBatch(2);
     \\ids.add(1);
     \\ids.add(2);
     \\transfers = client.lookupTransfers(ids);
     ,
 
-    .linked_events_example = 
+    .get_account_transfers_example =
+    \\AccountTransfers filter = new AccountTransfers();
+    \\filter.setAccountId(2);
+    \\filter.setTimestamp(0); // No filter by Timestamp.
+    \\filter.setLimit(10); // Limit to ten transfers at most.
+    \\filter.setDebits(true); // Include transfer from the debit side.
+    \\filter.setCredits(true); // Include transfer from the credit side.
+    \\filter.setReversed(true); // Sort by timestamp in reverse-chronological order.
+    \\transfers = client.getAccountTransfers(filter);
+    ,
+
+    .linked_events_example =
     \\transfers = new TransferBatch(10);
     \\
     \\// An individual transfer (successful):
@@ -498,19 +520,23 @@ pub const JavaDocs = Docs{
     \\transferErrors = client.createTransfers(transfers);
     ,
 
-    .developer_setup_sh_commands = 
+    .developer_setup_documentation = "",
+
+    .developer_setup_sh_commands =
     \\cd src/clients/java
     \\./scripts/install.sh
     \\if [ "$TEST" = "true" ]; then mvn test; else echo "Skipping client unit tests"; fi
     ,
 
-    .developer_setup_pwsh_commands = 
+    .developer_setup_pwsh_commands =
     \\cd src/clients/java
     \\.\scripts\install.bat
+    // Note: -Xms and -Xmx define the initial and max memory a JVM heap can have.
+    // It's needed as a workaround for Windows workers.
     \\if ($env:TEST -eq 'true') { mvn test } else { echo "Skipping client unit test" }
     ,
 
-    .test_main_prefix = 
+    .test_main_prefix =
     \\package com.tigerbeetle.samples;
     \\
     \\import com.tigerbeetle.*;

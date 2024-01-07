@@ -20,13 +20,15 @@ const StateMachine = vsr.state_machine.StateMachineType(Storage, constants.state
 const Header = vsr.Header;
 const Client = vsr.Client(StateMachine, MessageBus);
 
-pub const log_level: std.log.Level = .alert;
+pub const std_options = struct {
+    pub const log_level: std.log.Level = .alert;
+};
 
 pub const vsr_options = .{
-    .config_base = vsr.config.ConfigBase.default,
+    .config_base = .default,
     .config_log_level = std.log.Level.info,
-    .tracer_backend = vsr.config.TracerBackend.none,
-    .hash_log_mode = vsr.config.HashLogMode.none,
+    .tracer_backend = .none,
+    .hash_log_mode = .none,
     .config_aof_record = false,
     .config_aof_recovery = false,
 };
@@ -34,15 +36,15 @@ pub const vsr_options = .{
 pub fn request(
     operation: StateMachine.Operation,
     batch: anytype,
-    on_reply: fn (
+    on_reply: *const fn (
         user_data: u128,
         operation: StateMachine.Operation,
-        results: Client.Error![]const u8,
+        results: []const u8,
     ) void,
 ) !void {
     const allocator = std.heap.page_allocator;
     const client_id = std.crypto.random.int(u128);
-    const cluster_id: u32 = 0;
+    const cluster_id: u128 = 0;
     var addresses = [_]std.net.Address{try std.net.Address.parseIp4("127.0.0.1", constants.port)};
 
     var io = try IO.init(32, 0);
@@ -55,7 +57,7 @@ pub fn request(
         allocator,
         client_id,
         cluster_id,
-        @intCast(u8, addresses.len),
+        @as(u8, @intCast(addresses.len)),
         &message_pool,
         .{
             .configuration = &addresses,
@@ -64,18 +66,13 @@ pub fn request(
     );
     defer client.deinit(allocator);
 
-    const message = client.get_message();
-    defer client.unref(message);
+    const client_batch = client.batch_get(operation, batch.len) catch unreachable;
+    stdx.copy_disjoint(.exact, u8, client_batch.slice(), std.mem.asBytes(&batch));
 
-    const body = std.mem.asBytes(&batch);
-    stdx.copy_disjoint(.inexact, u8, message.buffer[@sizeOf(Header)..], body);
-
-    client.request(
+    client.batch_submit(
         0,
         on_reply,
-        operation,
-        message,
-        body.len,
+        client_batch,
     );
 
     while (client.request_queue.count > 0) {
@@ -87,7 +84,7 @@ pub fn request(
 pub fn on_create_accounts(
     user_data: u128,
     operation: StateMachine.Operation,
-    results: Client.Error![]const u8,
+    results: []const u8,
 ) void {
     _ = user_data;
     _ = operation;
@@ -98,7 +95,7 @@ pub fn on_create_accounts(
 pub fn on_lookup_accounts(
     user_data: u128,
     operation: StateMachine.Operation,
-    results: Client.Error![]const u8,
+    results: []const u8,
 ) void {
     _ = user_data;
     _ = operation;
@@ -109,7 +106,7 @@ pub fn on_lookup_accounts(
 pub fn on_lookup_transfers(
     user_data: u128,
     operation: StateMachine.Operation,
-    results: Client.Error![]const u8,
+    results: []const u8,
 ) void {
     _ = user_data;
     _ = operation;
@@ -120,7 +117,7 @@ pub fn on_lookup_transfers(
 pub fn on_create_transfers(
     user_data: u128,
     operation: StateMachine.Operation,
-    results: Client.Error![]const u8,
+    results: []const u8,
 ) void {
     _ = user_data;
     _ = operation;
@@ -128,9 +125,8 @@ pub fn on_create_transfers(
     print_results(CreateTransfersResult, results);
 }
 
-fn print_results(comptime Results: type, results: Client.Error![]const u8) void {
-    const body = results catch unreachable;
-    const slice = std.mem.bytesAsSlice(Results, body);
+fn print_results(comptime Results: type, results: []const u8) void {
+    const slice = std.mem.bytesAsSlice(Results, results);
     for (slice) |result| {
         std.debug.print("{}\n", .{result});
     }

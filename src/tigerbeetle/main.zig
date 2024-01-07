@@ -10,11 +10,13 @@ const build_options = @import("vsr_options");
 
 const vsr = @import("vsr");
 const constants = vsr.constants;
-const config = vsr.config.configs.current;
+const config = constants.config;
 const tracer = vsr.tracer;
 
+const ReplType = @import("repl.zig").ReplType;
+
 const cli = @import("cli.zig");
-const fatal = cli.fatal;
+const fatal = vsr.flags.fatal;
 
 const IO = vsr.io.IO;
 const Time = vsr.time.Time;
@@ -24,6 +26,7 @@ const AOF = vsr.aof.AOF;
 const MessageBus = vsr.message_bus.MessageBusReplica;
 const MessagePool = vsr.message_pool.MessagePool;
 const StateMachine = vsr.state_machine.StateMachineType(Storage, constants.state_machine_config);
+const Grid = vsr.GridType(vsr.storage.Storage);
 
 const AOFType = if (constants.aof_record) AOF else void;
 const Replica = vsr.ReplicaType(StateMachine, MessageBus, Storage, Time, AOFType);
@@ -31,8 +34,10 @@ const SuperBlock = vsr.SuperBlockType(Storage);
 const superblock_zone_size = vsr.superblock.superblock_zone_size;
 const data_file_size_min = vsr.superblock.data_file_size_min;
 
-pub const log_level: std.log.Level = constants.log_level;
-pub const log = constants.log;
+pub const std_options = struct {
+    pub const log_level: std.log.Level = constants.log_level;
+    pub const logFn = constants.log;
+};
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -54,12 +59,9 @@ pub fn main() !void {
         }, args.path),
         .start => |*args| try Command.start(&arena, args),
         .version => |*args| try Command.version(allocator, args.verbose),
+        .repl => |*args| try Command.repl(&arena, args),
     }
 }
-
-// Pad the cluster id number and the replica index with 0s
-const filename_fmt = "cluster_{d:0>10}_replica_{d:0>3}.tigerbeetle";
-const filename_len = fmt.count(filename_fmt, .{ 0, 0 });
 
 const Command = struct {
     dir_fd: os.fd_t,
@@ -127,7 +129,7 @@ const Command = struct {
 
     pub fn start(arena: *std.heap.ArenaAllocator, args: *const cli.Command.Start) !void {
         var traced_allocator = if (constants.tracer_backend == .tracy)
-            tracer.TracedAllocator.init(arena.allocator())
+            tracer.TracyAllocator("tracy").init(arena.allocator())
         else
             arena;
 
@@ -148,24 +150,32 @@ const Command = struct {
             aof = try AOF.from_absolute_path(aof_path);
         }
 
-        const grid_cache_size = args.cache_grid_blocks * constants.block_size;
+        const grid_cache_size = @as(u64, args.cache_grid_blocks) * constants.block_size;
+        const grid_cache_size_min = constants.block_size * Grid.Cache.value_count_max_multiple;
+
+        // The amount of bytes in `--cache-grid` must be a multiple of
+        // `constants.block_size` and `SetAssociativeCache.value_count_max_multiple`,
+        // and it may have been converted to zero if a smaller value is passed in.
+        if (grid_cache_size == 0) {
+            fatal("Grid cache must be greater than {}MB. See --cache-grid", .{
+                @divExact(grid_cache_size_min, 1024 * 1024),
+            });
+        }
+        assert(grid_cache_size >= grid_cache_size_min);
+
         const grid_cache_size_warn = 1024 * 1024 * 1024;
-        if (grid_cache_size <= grid_cache_size_warn) {
+        if (grid_cache_size < grid_cache_size_warn) {
             log_main.warn("Grid cache size of {}MB is small. See --cache-grid", .{
                 @divExact(grid_cache_size, 1024 * 1024),
             });
         }
 
-        const nonce = while (true) {
-            // `random.uintLessThan` does not work for u128 as of Zig 0.9.1.x.
-            const nonce_or_zero = std.crypto.random.int(u128);
-            if (nonce_or_zero != 0) break nonce_or_zero;
-        } else unreachable;
-        assert(nonce != 0);
+        const nonce = std.crypto.random.int(u128);
+        assert(nonce != 0); // Broken CSPRNG is the likeliest explanation for zero.
 
         var replica: Replica = undefined;
         replica.open(allocator, .{
-            .node_count = @intCast(u8, args.addresses.len),
+            .node_count = @as(u8, @intCast(args.addresses.len)),
             .storage_size_limit = args.storage_size_limit,
             .storage = &command.storage,
             .aof = &aof,
@@ -197,7 +207,7 @@ const Command = struct {
             var node_maybe = arena.state.buffer_list.first;
             while (node_maybe) |node| {
                 allocation_count += 1;
-                allocation_size += node.data.len;
+                allocation_size += node.data;
                 node_maybe = node.next;
             }
         }
@@ -211,7 +221,7 @@ const Command = struct {
         log_main.info("{}: cluster={}: listening on {}", .{
             replica.replica,
             replica.cluster,
-            args.addresses[replica.replica],
+            replica.message_bus.process.accept_address,
         });
 
         if (constants.aof_recovery) {
@@ -232,8 +242,8 @@ const Command = struct {
         const stdout = stdout_buffer.writer();
         try std.fmt.format(
             stdout,
-            "TigerBeetle version {s}",
-            .{build_options.git_tag orelse "experimental"},
+            "TigerBeetle version {s}\n",
+            .{build_options.version},
         );
 
         if (verbose) {
@@ -243,7 +253,7 @@ const Command = struct {
                 \\git_commit="{s}"
                 \\
             ,
-                .{build_options.git_commit orelse "?"},
+                .{build_options.git_commit},
             );
 
             try stdout.writeAll("\n");
@@ -251,26 +261,30 @@ const Command = struct {
                 try print_value(stdout, "build." ++ declaration, @field(builtin, declaration));
             }
 
-            // TODO(Zig): Use meta.fieldNames() after upgrading to 0.10.
-            // See: https://github.com/ziglang/zig/issues/10235
+            // Zig 0.10 doesn't see field_name as comptime if this `comptime` isn't used.
             try stdout.writeAll("\n");
-            inline for (std.meta.fields(@TypeOf(config.cluster))) |field| {
-                try print_value(stdout, "cluster." ++ field.name, @field(config.cluster, field.name));
+            inline for (comptime std.meta.fieldNames(@TypeOf(config.cluster))) |field_name| {
+                try print_value(stdout, "cluster." ++ field_name, @field(config.cluster, field_name));
             }
 
             try stdout.writeAll("\n");
-            inline for (std.meta.fields(@TypeOf(config.process))) |field| {
-                try print_value(stdout, "process." ++ field.name, @field(config.process, field.name));
+            inline for (comptime std.meta.fieldNames(@TypeOf(config.process))) |field_name| {
+                try print_value(stdout, "process." ++ field_name, @field(config.process, field_name));
             }
         }
         try stdout_buffer.flush();
+    }
+
+    pub fn repl(arena: *std.heap.ArenaAllocator, args: *const cli.Command.Repl) !void {
+        const Repl = ReplType(vsr.message_bus.MessageBusClient);
+        try Repl.run(arena, args.addresses, args.cluster, args.statements, args.verbose);
     }
 };
 
 fn print_value(
     writer: anytype,
-    comptime field: []const u8,
-    comptime value: anytype,
+    field: []const u8,
+    value: anytype,
 ) !void {
     switch (@typeInfo(@TypeOf(value))) {
         .Fn => {}, // Ignore the log() function.
@@ -278,7 +292,7 @@ fn print_value(
             field,
             std.fmt.fmtSliceEscapeLower(value),
         }),
-        else => try std.fmt.format(writer, "{s}={}\n", .{
+        else => try std.fmt.format(writer, "{s}={any}\n", .{
             field,
             value,
         }),

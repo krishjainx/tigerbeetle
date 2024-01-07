@@ -1,7 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const assert = std.debug.assert;
 
-pub const cmd_sep = if (builtin.os.tag == .windows) ";" else "&&";
+pub const command_separator = if (builtin.os.tag == .windows) ";" else "&&";
+pub const path_separator = if (builtin.os.tag == .windows) "\\" else "/";
 
 pub fn exec(
     arena: *std.heap.ArenaAllocator,
@@ -39,7 +41,7 @@ pub fn run_with_env(
     }
     std.debug.print("\n", .{});
 
-    var cp = try std.ChildProcess.init(cmd, arena.allocator());
+    var cp = std.ChildProcess.init(cmd, arena.allocator());
 
     var env_map = try std.process.getEnvMap(arena.allocator());
     i = 0;
@@ -82,10 +84,7 @@ pub fn shell_wrap(arena: *std.heap.ArenaAllocator, cmd: []const u8) ![]const []c
     if (builtin.os.tag == .windows) {
         try wrapped.append(try std.fmt.allocPrint(
             arena.allocator(),
-            // \\Set-StrictMode -Version 3;
-            // \\$ErrorActionPreference = 'Stop';
-            // \\$PSDefaultParameterValues['*:ErrorAction']='Stop';
-            // \\$LASTEXITCODE = 0;
+            \\Set-PSDebug -Trace 1
             \\
             \\{s}
         ,
@@ -96,13 +95,6 @@ pub fn shell_wrap(arena: *std.heap.ArenaAllocator, cmd: []const u8) ![]const []c
                 ";",
                 "; if(!$?) { Exit $LASTEXITCODE }; ",
             )},
-            // .{try std.mem.replaceOwned(
-            //     u8,
-            //     arena.allocator(),
-            //     cmd,
-            //     "\"",
-            //     "\\\"",
-            // )},
         ));
     } else {
         try wrapped.append(cmd);
@@ -154,38 +146,11 @@ pub const TmpDir = struct {
 };
 
 pub fn git_root(arena: *std.heap.ArenaAllocator) ![]const u8 {
-    var prefix: []const u8 = "";
-    var tries: i32 = 0;
-    while (tries < 100) {
-        var dir = std.fs.cwd().openDir(
-            try std.fmt.allocPrint(
-                arena.allocator(),
-                "{s}.git",
-                .{prefix},
-            ),
-            .{},
-        ) catch {
-            prefix = try std.fmt.allocPrint(
-                arena.allocator(),
-                "../{s}",
-                .{prefix},
-            );
-            tries += 1;
-            continue;
-        };
-
-        // When looking up realpathAlloc, it can't be an empty string.
-        if (prefix.len == 0) {
-            prefix = ".";
-        }
-
-        const path = try std.fs.cwd().realpathAlloc(arena.allocator(), prefix);
-        dir.close();
-        return path;
-    }
-
-    std.debug.print("Failed to find .git root of TigerBeetle repo.\n", .{});
-    return error.CouldNotFindGitRoot;
+    const exec_result = try exec(arena, &.{ "git", "rev-parse", "--show-toplevel" });
+    // As conventional, output includes a trailing `\n` which we need to strip away.
+    assert(!std.mem.endsWith(u8, exec_result.stdout, "\r\n"));
+    assert(std.mem.endsWith(u8, exec_result.stdout, "\n"));
+    return exec_result.stdout[0 .. exec_result.stdout.len - 1];
 }
 
 // Makes sure a local script name has the platform-appropriate folder
@@ -195,10 +160,10 @@ pub fn git_root(arena: *std.heap.ArenaAllocator) ![]const u8 {
 // waste.
 pub fn script_filename(arena: *std.heap.ArenaAllocator, parts: []const []const u8) ![]const u8 {
     var file_name = std.ArrayList(u8).init(arena.allocator());
-    const sep = if (builtin.os.tag == .windows) '\\' else '/';
+
     _ = try file_name.append('.');
     for (parts) |part| {
-        _ = try file_name.append(sep);
+        _ = try file_name.appendSlice(path_separator);
         _ = try file_name.appendSlice(part);
     }
 
@@ -208,10 +173,9 @@ pub fn script_filename(arena: *std.heap.ArenaAllocator, parts: []const []const u
 
 pub fn binary_filename(arena: *std.heap.ArenaAllocator, parts: []const []const u8) ![]const u8 {
     var file_name = std.ArrayList(u8).init(arena.allocator());
-    const sep = if (builtin.os.tag == .windows) '\\' else '/';
     _ = try file_name.append('.');
     for (parts) |part| {
-        _ = try file_name.append(sep);
+        _ = try file_name.appendSlice(path_separator);
         _ = try file_name.appendSlice(part);
     }
 
@@ -219,10 +183,18 @@ pub fn binary_filename(arena: *std.heap.ArenaAllocator, parts: []const []const u
     return file_name.items;
 }
 
-pub fn file_or_directory_exists(arena: *std.heap.ArenaAllocator, f_or_d: []const u8) bool {
-    _ = std.fs.cwd().realpathAlloc(arena.allocator(), f_or_d) catch {
-        return false;
+pub fn file_or_directory_exists(f_or_d: []const u8) bool {
+    var file = std.fs.cwd().openFile(f_or_d, .{}) catch |err| {
+        switch (err) {
+            error.FileNotFound => return false,
+            error.IsDir => return true,
+            else => std.debug.panic(
+                "unexpected error while checking file_or_directory_exists({s}): {s}",
+                .{ f_or_d, @errorName(err) },
+            ),
+        }
     };
+    file.close();
 
     return true;
 }
@@ -237,9 +209,9 @@ pub fn write_shell_newlines_into_single_line(
 
     var lines = std.mem.split(u8, from, "\n");
     while (lines.next()) |line| {
-        try into.writer().print("{s} {s} ", .{ line, cmd_sep });
+        try into.writer().print("{s} {s} ", .{ line, command_separator });
     }
 
-    // The above commands all end with ` {cmd_sep} `
+    // The above commands all end with ` {command_separator} `
     try into.appendSlice("echo ok");
 }

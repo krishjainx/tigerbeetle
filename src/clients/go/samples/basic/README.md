@@ -12,7 +12,7 @@ support. But for ease of development we also support macOS and Windows.
 * Go >= 1.17
 
 **Additionally on Windows**: you must install [Zig
-0.9.1](https://ziglang.org/download/#release-0.9.1) and set the
+0.11.0](https://ziglang.org/download/#release-0.11.0) and set the
 `CC` environment variable to `zig.exe cc`. Use the full path for
 `zig.exe`.
 
@@ -23,16 +23,14 @@ First, clone this repo and `cd` into `tigerbeetle/src/clients/go/samples/basic`.
 Then, install the TigerBeetle client:
 
 ```console
-$ go mod init tbtest
-$ go mod tidy
+go mod init tbtest
+go get github.com/tigerbeetle/tigerbeetle-go
 ```
 
 ## Start the TigerBeetle server
 
-Follow steps in the repo README to start a **single
-server** [from a single
-binary](/README.md#single-binary) or [in a Docker
-container](/README.md#with-docker).
+Follow steps in the repo README to [run
+TigerBeetle](/README.md#running-tigerbeetle).
 
 If you are not running on port `localhost:3000`, set
 the environment variable `TB_ADDRESS` to the full
@@ -43,7 +41,7 @@ address of the TigerBeetle server you started.
 Now you can run this sample:
 
 ```console
-$ go run main.go
+go run main.go
 ```
 
 ## Walkthrough
@@ -69,4 +67,3 @@ checks that **account `1`** has:
 And that **account `2`** has:
  * `debits_posted= 0`
  * and `credits_posted = 10`
-

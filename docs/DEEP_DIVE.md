@@ -1,7 +1,6 @@
 # Install TigerBeetle, benchmark! and work your way through six demos...
 
 - [Clone TigerBeetle](#clone-tigerbeetle)
-- [Upgrade Ubuntu to the 5.7.15 kernel](#upgrade-ubuntu-to-the-5715-kernel)
 - [Install Zig](./HACKING.md#setup)
 - [Simulate non-pristine lab conditions](#simulate-non-pristine-lab-conditions)
 - [Benchmark!](#benchmark)
@@ -14,14 +13,8 @@
 ## Clone TigerBeetle
 
 ```bash
-git clone https://github.com/coilhq/tigerbeetle.git
+git clone https://github.com/tigerbeetle/tigerbeetle.git
 cd tigerbeetle/
-```
-
-## Upgrade Ubuntu to the 5.7.15 kernel
-
-```bash
-scripts/upgrade_ubuntu_kernel.sh
 ```
 
 ## Install Zig and build TigerBeetle
@@ -52,7 +45,7 @@ Let's turn up the log level some more (and your favorite album), so you can see 
 
 - Open `src/config.zig` in your editor and change `log_level` to `.debug`.
 
-- Rebuild TigerBeetle using the new debug log level by running `zig/zig build -Drelease-safe && mv zig-out/bin/tigerbeetle .`
+- Rebuild TigerBeetle using the new debug log level by running `zig/zig build -Drelease && mv zig-out/bin/tigerbeetle .`
 
 - Start a single replica cluster:
 Format the data file:

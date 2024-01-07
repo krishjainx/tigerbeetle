@@ -15,7 +15,7 @@
 #include "../tb_client.h"
 
 // config.message_size_max - @sizeOf(vsr.Header):
-#define MAX_MESSAGE_SIZE (1024 * 1024) - 128
+#define MAX_MESSAGE_SIZE (1024 * 1024) - 256
 
 // Synchronization context between the callback and the main thread.
 typedef struct completion_context {
@@ -60,7 +60,9 @@ int main(int argc, char **argv) {
     printf("TigerBeetle C Sample\n");
     printf("Connecting...\n");
     tb_client_t client;
-    const char *address = "127.0.0.1:3000";
+    
+    const char *address = getenv("TB_ADDRESS");
+    if (address == NULL) address = "3000";
 
     TB_STATUS status = tb_client_init(
         &client,              // Output client.
@@ -68,7 +70,7 @@ int main(int argc, char **argv) {
         address,              // Cluster addresses.
         strlen(address),      //
         32,                   // ConcurrencyMax, could be 1, since it's a single-threaded example.
-        NULL,                 // No need for a global context.
+        (uintptr_t)NULL,      // No need for a global context.
         &on_completion        // Completion callback.
     );
 

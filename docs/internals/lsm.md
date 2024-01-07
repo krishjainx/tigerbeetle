@@ -1,5 +1,5 @@
 ---
-sidebar_position: 2
+sidebar_position: 3
 ---
 
 # LSM
@@ -24,11 +24,11 @@ Documentation for (roughly) code in the `src/lsm` directory.
 
 A tree is a hierarchy of in-memory and on-disk tables. There are three categories of tables:
 
-- The [mutable table](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/lsm/table_mutable.zig) is an in-memory table.
+- The [mutable table](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/lsm/table_memory.zig) is an in-memory table.
   - Each tree has a single mutable table.
   - All tree updates, inserts, and removes are applied to the mutable table.
   - The mutable table's size is allocated to accommodate a full bar of updates.
-- The [immutable table](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/lsm/table_immutable.zig) is an in-memory table.
+- The [immutable table](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/lsm/table_memory.zig) is an in-memory table.
   - Each tree has a single immutable table.
   - The mutable table's contents are periodically moved to the immutable table,
     where they are stored while being flushed to level `0`.
@@ -36,7 +36,7 @@ A tree is a hierarchy of in-memory and on-disk tables. There are three categorie
   immutable on-disk tables.
   - Each tree has as many as `config.lsm_growth_factor ^ (level + 1)` tables per level.
     (`config.lsm_growth_factor` is typically 8).
-  - Within a given level and snapshot, the tables' key ranges are [disjoint](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/lsm/manifest_level.zig).
+  - Within a given level and snapshot, the tables' key ranges are [disjoint](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/lsm/manifest_level.zig).
 
 ## Compaction
 
@@ -63,7 +63,7 @@ Each compaction compacts a [single table](#compaction-selection-policy) from `le
 
 Invariants:
 * At the end of every beat, there is space in mutable table for the next beat.
-* The manifest log is compacted at the end of every beat.
+* The manifest log is compacted during every half-bar.
 * The compactions' output tables are not [visible](#snapshots-and-compaction) until the compaction has finished.
 
 1. First half-bar, first beat ("first beat"):
@@ -108,7 +108,7 @@ Level 2     b───d e─────h i───k l───n o─p q──�
 ```
 
 Links:
-- [`Manifest.compaction_table`](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/lsm/manifest.zig)
+- [`Manifest.compaction_table`](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/lsm/manifest.zig)
 - [Constructing and Analyzing the LSM Compaction Design Space](http://vldb.org/pvldb/vol14/p2216-sarkar.pdf) describes the tradeoffs of various data movement policies. TigerBeetle implements the "least overlapping with parent" policy.
 - [Option of Compaction Priority](https://rocksdb.org/blog/2016/01/29/compaction_pri.html)
 
@@ -162,12 +162,10 @@ queries against past states of the tree (unimplemented; future work).
 Consider the half-bar compaction beginning at op=`X` (`12`), with `lsm_batch_multiple=M` (`8`).
 Each half-bar contains `N=M/2` (`4`) beats. The next half-bar begins at `Y=X+N` (`16`).
 
-During the half-bar compaction `X` (op=`X…Y-1`; `12…15`), each commit prefetches from the snapshot
-[equal to its own op](#current-snapshot). As shown, they continue to query the old (input) tables.
-
 During the half-bar compaction `X`:
 - `snapshot_max` of each input table is truncated to `Y-1` (`15`).
 - `snapshot_min` of each output table is initialized to `Y` (`16`).
+- `snapshot_max` of each output table is initialized to `∞`.
 
 ```
 0   4   8  12  16  20  24  (op, snapshot)
@@ -190,38 +188,8 @@ At this point the input tables can be removed if they are invisible to all persi
 ### Snapshot Queries
 
 Each query targets a particular snapshot, either:
-- the [current snapshot](#current-snapshot), or
+- the current snapshot (`snapshot_latest`), or
 - a [persisted snapshot](#persistent-snapshots).
-
-#### Current Snapshot
-
-Each tree tracks the highest snapshot safe to query from (`tree.lookup_snapshot_max`), to ensure that
-an ongoing compaction's incomplete output tables are not visible. Queries targeting
-`tree.lookup_snapshot_max` always read from the mutable and immutable tables — so each commit can
-see all previous commits' updates.)
-
-During typical operation, the `lookup_snapshot_max` when prefetching op `S` is snapshot `S`.
-The following chart depicts:
-- `lookup_snapshot_max` (`$`)
-- for each commit op (the left column)
-- and a compaction that began at op `12` and completed at the end of op `15`.
-
-```
-op  0   4   8  12  16  20  24  (op, snapshot)
-    ┼───┬───┼───┬───┼───┬───┼
-12  ····────────$───
-13  ····─────────$──
-14  ····──────────$─
-15  ····───────────$
-16                  $────····
-17                  ─$───····
-18                  ──$──····
-19                  ───$─····
-```
-
-However, commits in the first measure following recovery from a checkpoint prefetch from a higher
-snapshot to avoid querying tables that were deleted at the checkpoint.
-See [`lookup_snapshot_max_for_checkpoint()`](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/lsm/tree.zig) for more detail.
 
 #### Persistent Snapshots
 
@@ -260,15 +228,14 @@ At the end of the last beat of the compaction bar (`23`):
 ## Manifest
 
 The manifest is a tree's index of table locations and metadata.
-(Not to be confused with the [SuperBlock Manifest](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/vsr/superblock_manifest.zig)).
 
 Each manifest has two components:
-- a single [`ManifestLog`](#manifest-log) shared by all levels, and
+- a single [`ManifestLog`](#manifest-log) shared by all trees and levels, and
 - one [`ManifestLevel`](#manifest-level) for each on-disk level.
 
 ### Manifest Log
 
-The manifest log is an on-disk log of all updates to the tree's table index.
+The manifest log is an on-disk log of all updates to the trees' table indexes.
 
 The manifest log tracks:
 
@@ -286,7 +253,9 @@ The manifest log is periodically compacted to remove older entries that have bee
 newer entries. For example, if a table is created and later deleted, manifest log compaction
 will eventually remove any reference to the table from the log blocks.
 
-All manifest log blocks are tracked in the superblock manifest.
+Each manifest block has a reference to the (chronologically) previous manifest block.
+The superblock stores the head and tail address/checksum of this linked list.
+The reference on the header of the head manifest block "dangles" – the block it references has already been compacted.
 
 ### Manifest Level
 

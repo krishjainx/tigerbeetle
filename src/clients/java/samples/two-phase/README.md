@@ -19,15 +19,13 @@ First, clone this repo and `cd` into `tigerbeetle/src/clients/java/samples/two-p
 Then, install the TigerBeetle client:
 
 ```console
-$ mvn install
+mvn install
 ```
 
 ## Start the TigerBeetle server
 
-Follow steps in the repo README to start a **single
-server** [from a single
-binary](/README.md#single-binary) or [in a Docker
-container](/README.md#with-docker).
+Follow steps in the repo README to [run
+TigerBeetle](/README.md#running-tigerbeetle).
 
 If you are not running on port `localhost:3000`, set
 the environment variable `TB_ADDRESS` to the full
@@ -38,7 +36,7 @@ address of the TigerBeetle server you started.
 Now you can run this sample:
 
 ```console
-$ mvn exec:java
+mvn exec:java
 ```
 
 ## Walkthrough
@@ -103,4 +101,3 @@ And that **account `2`** has:
  * `credits_posted = 500`
  * `debits_pending = 0`
  * and `credits_pending = 0`
-

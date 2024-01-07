@@ -8,7 +8,7 @@ Code for this sample is in [./main.js](./main.js).
 ## Prerequisites
 
 Linux >= 5.6 is the only production environment we
-support. But for ease of development we also support macOS. Windows is not yet supported.
+support. But for ease of development we also support macOS and Windows.
 * NodeJS >= `14`
 
 ## Setup
@@ -18,15 +18,13 @@ First, clone this repo and `cd` into `tigerbeetle/src/clients/node/samples/two-p
 Then, install the TigerBeetle client:
 
 ```console
-$ npm install tigerbeetle-node
+npm install tigerbeetle-node
 ```
 
 ## Start the TigerBeetle server
 
-Follow steps in the repo README to start a **single
-server** [from a single
-binary](/README.md#single-binary) or [in a Docker
-container](/README.md#with-docker).
+Follow steps in the repo README to [run
+TigerBeetle](/README.md#running-tigerbeetle).
 
 If you are not running on port `localhost:3000`, set
 the environment variable `TB_ADDRESS` to the full
@@ -37,7 +35,7 @@ address of the TigerBeetle server you started.
 Now you can run this sample:
 
 ```console
-$ node main.js
+node main.js
 ```
 
 ## Walkthrough
@@ -102,4 +100,3 @@ And that **account `2`** has:
  * `credits_posted = 500`
  * `debits_pending = 0`
  * and `credits_pending = 0`
-

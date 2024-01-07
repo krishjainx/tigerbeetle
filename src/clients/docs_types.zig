@@ -49,9 +49,9 @@ pub const Docs = struct {
 
     // Alters the project to use a package built from the current commit
     // Runs before .install_commands
-    current_commit_pre_install_hook: ?fn (*std.heap.ArenaAllocator, []const u8, []const u8) anyerror!void,
+    current_commit_pre_install_hook: ?*const fn (*std.heap.ArenaAllocator, []const u8, []const u8) anyerror!void,
     // Runs after .install_commands
-    current_commit_post_install_hook: ?fn (*std.heap.ArenaAllocator, []const u8, []const u8) anyerror!void,
+    current_commit_post_install_hook: ?*const fn (*std.heap.ArenaAllocator, []const u8, []const u8) anyerror!void,
 
     // Any setup needed for a project before compiling and running
     // such as `go mod init myProject && go mod tidy` or `npm install
@@ -65,9 +65,9 @@ pub const Docs = struct {
     // Commands for building and running code.
     run_commands: Code,
 
-    current_commit_install_commands_hook: ?fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
-    current_commit_build_commands_hook: ?fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
-    current_commit_run_commands_hook: ?fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
+    current_commit_install_commands_hook: ?*const fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
+    current_commit_build_commands_hook: ?*const fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
+    current_commit_run_commands_hook: ?*const fn (*std.heap.ArenaAllocator, Code) anyerror!Code,
 
     // Additional instructions for install.
     install_documentation: Markdown,
@@ -107,14 +107,14 @@ pub const Docs = struct {
 
     lookup_transfers_example: Code,
 
+    get_account_transfers_example: Code,
+
     linked_events_example: Code,
+
+    developer_setup_documentation: Markdown,
 
     developer_setup_sh_commands: Code,
     developer_setup_pwsh_commands: Code,
-
-    // Docker image to use to build and run commands in. (Not shown to
-    // user.)
-    test_linux_docker_image: String,
 
     // Optional prefix if test code must be in a certain directory
     // (e.g. Java and `src/main/java`).
